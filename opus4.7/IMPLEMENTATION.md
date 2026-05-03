@@ -1,323 +1,576 @@
-# Implementation Bootstrap
+# IMPLEMENTATION.md — building the autoresearch harness
 
-This is a **one-time bootstrap job**. You are setting up the autoresearch infrastructure. You are NOT running experiments — that is a separate driver agent's job, governed by `program.md`. When you finish, hand off and stop.
+You are the implementation agent. This is a **one-time bootstrap job**:
+build the repo described here so that the autoresearch loop documented
+in `program.md` can run.
 
-`program.md` is the authoritative spec for shared definitions: model choices, the four metrics, the promotion gate (`epsilon = 0.01`), the 3-seed re-eval, the held-out validation rule, and the VLM-judge "diagnostic only" stance. This document only adds what is specific to *building* the harness. Where `program.md` already defines something, this doc references it instead of restating.
+You are NOT running experiments. The autoresearch driver agent will do
+that, in a separate session, after you finish. Don't edit
+`prompt_strategy.py` beyond shipping the baseline. Don't run the
+optimization loop.
 
-## What you're building
+`program.md` is the authoritative spec. Read it first. This doc
+describes how to bring the spec into being.
 
-A fixed, frozen benchmark harness for an autoresearch loop. The driver agent will edit one file (`prompt_strategy.py`), run `uv run harness.py --name <…>`, and read scores. Everything else — image loading, generation, featurization, the four similarity metrics, the gate, 3-seed re-eval, logbook append, VLM-judge — lives in code you write now and nobody touches afterward.
+---
 
-### Driver agent vs. inner VLM (carried over from `program.md`)
+## 1. What you're building
 
-The **driver** is a coding agent (Claude Code / Codex / Gemini CLI / etc.) that edits `prompt_strategy.py` and runs experiments. The **inner VLM** is `gemini-3.1-flash-lite-preview`, called from inside `prompt_strategy.image_to_prompt(...)`. They are different — your harness must be agnostic to which driver agent runs it.
+A Python repo that lets a coding agent run an autonomous research loop
+on prompt-from-image generation. The loop:
 
-## Stack
+1. Calls a VLM to caption a reference image into a generation prompt.
+2. Generates an image from the prompt.
+3. Scores reproduction fidelity with four complementary similarity
+   metrics.
+4. Promotes a new prompting strategy only if it strictly improves
+   without regressing on any individual metric, and survives a
+   3-seed re-evaluation.
 
-| Role | Model / Library |
-|---|---|
-| Inner VLM | `gemini-3.1-flash-lite-preview` (called from baseline `prompt_strategy.py`) |
-| Image generator | `gemini-3.1-flash-image-preview` (Nano Banana 2), 1024×1024, defaults |
-| Semantic embedding | `gemini-embedding-2-preview`, 3072-d, multimodal |
-| Structural | `facebook/dinov3-vitb16-pretrain-lvd1689m` via HuggingFace `transformers` |
-| Perceptual | `lpips` package (AlexNet backbone) |
-| Color | HSV histogram 8×8×8 + chi-square (numpy/scipy) |
+The methodology follows Andrej Karpathy's
+[autoresearch](https://github.com/karpathy/autoresearch) pattern: one
+file is the agent's degree of freedom, everything else is fixed
+infrastructure. Comparability across experiments depends on the harness
+being unchanging.
 
-CPU-only execution must work. No CUDA assumption.
+## 2. Stack
 
-## Why these specific local metrics
+| Role | Model / Method | Notes |
+|---|---|---|
+| **VLM** | `gemini-3.1-flash-lite-preview` (Gemini API) | Called from `prompt_strategy.py`. Driver agent will iterate on this. |
+| **Image generator** | `gemini-3.1-flash-image-preview` / Nano Banana 2 (Gemini API) | Called from `harness.py`. Fixed config: 1024×1024, defaults. |
+| **Semantic similarity** | `gemini-embedding-2-preview` (Gemini API) | Multimodal: embeds images and text into shared 3072-d space. |
+| **Structural similarity** | DINOv2 ViT-B/14 (`facebook/dinov2-base`, local via `transformers`, Apache 2.0) | Self-supervised vision features. ~330 MB. |
+| **Perceptual similarity** | LPIPS, AlexNet backbone (`lpips` package, local) | ~25 MB. |
+| **Color similarity** | HSV histogram, chi-square distance (computed locally) | No model needed. |
 
-Gemini multimodal embeddings capture semantic content, not visual fidelity. Two photos of "golden retriever on grass" can embed close together while looking nothing alike. A driver will Goodhart any single metric. Three additional locally-computed metrics span axes roughly orthogonal to the semantic one:
+Python 3.11+, dependencies managed by `uv`. CPU-only execution must
+work; GPU is used automatically if present.
 
-- **DINOv3 ViT-B/16 (structural).** Self-supervised features capturing pose, layout, appearance. Catches "right concept, wrong arrangement" failures the embedding misses.
-- **LPIPS / AlexNet (perceptual).** Texture and fine-detail similarity, trained against human similarity judgments. Catches "looks the same to a captioner, looks wrong to a person."
-- **HSV 8×8×8 + chi² (color).** Explicit palette match. Catches "right object, wrong colors" — a common Nano Banana 2 failure mode that DINOv3, LPIPS, and Gemini all soft-pedal.
+### Why these specific local metrics
 
-Together with `s_gemini`, the four cover semantics, structure, perception, and color. The promotion gate enforces no-regression on each axis with `epsilon = 0.01`, so the driver cannot trade one for another.
+The Gemini embedding alone is insufficient: it captures semantic
+content but not structural fidelity. Two photos that both depict
+"golden retriever on grass" embed close together while looking
+nothing alike. The driver agent will Goodhart any single metric. The
+local metrics fill specific gaps:
 
-## Local-metric compute requirements
+- **DINOv2** — self-supervised vision transformer features. Strong on
+  layout, pose, and object appearance. Nearly orthogonal to semantic
+  embedding. We use DINOv2 (Apache 2.0) rather than DINOv3 (Meta's
+  custom commercial license) for licensing simplicity; for our
+  pair-similarity use case the practical gap is small, since DINOv3's
+  improvements are mostly on dense-prediction tasks.
+- **LPIPS** — perceptual distance trained against human similarity
+  judgments. Catches texture and fine-detail mismatches.
+- **HSV histogram + chi-square** — explicit color-palette match. Cheap,
+  catches "right object, wrong colors" failures that perceptual metrics
+  often miss.
 
-Per 20-image experiment, on CPU: combined local metrics add ~10s. Bottleneck is API generation (~3–5 min for the 20 Nano Banana 2 calls). Original-image features are computed once and cached on disk; each subsequent run only featurizes the 20 regenerated images. DINOv3 weights download once on first run (~330 MB) into `weights/`.
+Together with Gemini Embedding 2, these four signals span roughly
+orthogonal axes of "do these images match", which is what makes the
+no-regression gate (defined in `program.md`) a meaningful guard
+against optimization metric leakage.
 
-## Repo layout to create
+### Local-metric compute requirements
+
+Per regenerated image, on CPU:
+
+- DINOv2 ViT-B/14 forward pass: ~400 ms
+- LPIPS pair comparison: ~30 ms
+- HSV histogram + chi-square: ~5 ms
+
+For a 20-image experiment, all local metrics combined add ~10 seconds
+on CPU. The bottleneck is the 20 Nano Banana 2 generations (~3–5 min
+wall clock); local scoring is in the noise. Original-image features
+are cached on first run; only regenerated-image features are computed
+per experiment.
+
+## 3. Repo layout to create
 
 ```
-.
-├── program.md              # already provided; you do not write this
-├── IMPLEMENTATION.md       # this file
-├── prompt_strategy.py      # baseline you ship; driver edits later
-├── harness.py              # the immutable benchmark
-├── embed_and_score.py      # featurize / similarity / compose / gate / vlm_judge
-├── eval_images/            # human populates; you create the dir empty
-├── val_images/             # human populates; you create the dir empty
-├── runs/                   # auto-created at runtime
-├── cache/                  # auto-created; original-image features
-├── weights/                # auto-created; DINOv3 weights
-├── logbook.md              # empty starting file with header `# Logbook`
-├── pyproject.toml
-├── .env.example
-├── .gitignore
-└── AGENTS.md -> program.md # symlink
+prompt_strategy.py    ← baseline you ship; driver iterates on it
+harness.py            ← you implement
+embed_and_score.py    ← you implement
+eval_images/          ← human will populate; do not auto-fill
+val_images/           ← human will populate; do not auto-fill
+cache/                ← auto-created at runtime, git-ignored
+runs/                 ← auto-created at runtime, git-ignored
+weights/              ← auto-created at runtime, git-ignored
+logbook.md            ← start empty with a single "# Logbook" header
+program.md            ← already exists; do not modify
+README.md             ← already exists; do not modify
+IMPLEMENTATION.md     ← this file; you can leave it in place
+AGENTS.md             ← symlink to program.md (you create)
+pyproject.toml        ← you create
+.env.example          ← you create
+.env                  ← human creates from .env.example; never commit
+.gitignore            ← you create
 ```
 
-`README.md` is a separate artifact and is **not** your responsibility. Do not create one.
+## 4. Build sequence
 
-## Build sequence
+Do this top to bottom. Don't skip the smoke test in step 9.
 
-1. `uv init --python 3.11`
-2. Author `pyproject.toml` (see below).
-3. `uv sync`
-4. Write `.gitignore` covering `.env`, `runs/`, `cache/`, `weights/`, `__pycache__/`, `*.pyc`, `.venv/`.
-5. Write `.env.example` listing required vars: `GEMINI_API_KEY` (required), `HF_HOME` (optional).
-6. Implement `embed_and_score.py` per contract below.
-7. Implement `harness.py` per contract below.
-8. Ship baseline `prompt_strategy.py` (verbatim code below).
-9. Create empty `eval_images/` and `val_images/` directories.
-10. `ln -s program.md AGENTS.md`.
-11. Smoke test 1: `featurize` on a synthetic 448×448 red image.
-12. Smoke test 2 (only if eval images already populated): full harness with `--no-judge`.
-13. Initial git commit: `git init && git add -A && git commit -m "bootstrap"`.
-14. Hand off (template at bottom).
+1. **Initialize the project.** `uv init`, replace the generated
+   `pyproject.toml` with the one in section 5, run `uv sync`.
+2. **Create `.gitignore`.** Must exclude: `.env`, `weights/`,
+   `cache/`, `runs/`, `__pycache__/`, `*.pyc`, `.venv/`.
+3. **Create `.env.example`** with `GEMINI_API_KEY=` (no value).
+4. **Implement `embed_and_score.py`** per section 6.
+5. **Implement `harness.py`** per section 7.
+6. **Ship the baseline `prompt_strategy.py`** per section 8.
+7. **Set up image directories.** `mkdir -p eval_images val_images`.
+   If empty, see section 9 — likely requires pausing to ask the human.
+8. **Symlink `program.md` to `AGENTS.md`:**
+   `ln -s program.md AGENTS.md`. (If on Windows or a filesystem
+   without symlinks, copy the file instead.)
+9. **Run the smoke test** in section 10.
+10. **Initial git commit:** `init: bootstrap autoresearch repo`.
+11. **Hand off** with the message in section 11.
 
-## `pyproject.toml`
+## 5. `pyproject.toml`
 
-Python 3.11+. Dependencies (pin loosely with `>=`, not `==`):
+```toml
+[project]
+name = "image-prompt-autoresearch"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+  "google-genai",        # Gemini API (VLM, generator, embeddings)
+  "torch",               # for DINOv2 + LPIPS
+  "transformers",        # DINOv2 weights from HuggingFace
+  "lpips",               # perceptual similarity
+  "pillow",              # image I/O
+  "numpy",
+  "scipy",               # chi-square distance, robust stats
+  "python-dotenv",       # loads .env
+]
+```
 
-- `google-genai`
-- `torch`
-- `transformers`
-- `lpips`
-- `pillow`
-- `numpy`
-- `scipy`
-- `python-dotenv`
+Note: torch wheels are large. Don't pin a specific torch version
+unless required — let `uv` resolve a compatible one.
 
-No optional script entry needed; `uv run harness.py` is sufficient.
+## 6. `embed_and_score.py` — implementation contract
 
-## `embed_and_score.py` implementation contract
+### Module-level setup
 
-### Module-level setup (runs once on import)
-
-- `dotenv.load_dotenv()`
-- Gemini client from `google.genai` using `os.environ["GEMINI_API_KEY"]`.
-- DINOv3 model + image processor from `transformers`, `cache_dir="weights/"`, `.eval()`.
-- LPIPS model `lpips.LPIPS(net='alex')`, `.eval()`.
-- Device detection: prefer `cuda` if available, else `mps`, else `cpu`. Move DINOv3 and LPIPS to device. **The CPU path must work end-to-end with no further branching.**
+- Load `dotenv` and read `GEMINI_API_KEY`. Fail fast with a clear
+  error if missing.
+- Instantiate the Gemini client once.
+- Load DINOv2 ViT-B/14:
+  ```python
+  from transformers import AutoModel, AutoImageProcessor
+  dino_model = AutoModel.from_pretrained("facebook/dinov2-base")
+  dino_processor = AutoImageProcessor.from_pretrained("facebook/dinov2-base")
+  ```
+  Set `cache_dir="weights/"`. Move to GPU if available.
+- Load LPIPS: `lpips_model = lpips.LPIPS(net='alex')`. Store its
+  weights under `weights/`. Move to GPU if available.
+- Detect device: `torch.device("cuda" if torch.cuda.is_available() else "cpu")`.
+  All local computation must work CPU-only.
 
 ### Canonical preprocessing
 
-A single helper applied everywhere:
-
-```python
-def _canon(image: PIL.Image.Image) -> PIL.Image.Image:
-    return image.convert("RGB").resize((448, 448), PIL.Image.LANCZOS)
-```
-
-Used by `featurize` for DINOv3, LPIPS, and the HSV histogram. The Gemini embedding call is also fed the canonical 448×448 RGB image so all four metrics share the same input crop.
+All images are resized to **448×448 with PIL `LANCZOS`** before any
+feature extraction. This is the canonical resolution; do not change
+it. Reason: 448 is a multiple of DINOv2's patch size 14 (448 / 14 = 32)
+and provides
+enough detail for LPIPS without inflating cost.
 
 ### Public functions
 
 ```python
 def featurize(image: PIL.Image.Image) -> dict:
-    """Returns:
-        'gemini':       np.ndarray, shape (3072,), L2-normalized
-        'dino':         np.ndarray, shape (768,),  L2-normalized (CLS token)
-        'lpips_tensor': torch.Tensor, shape (1, 3, 448, 448), normalized to [-1, 1]
-        'color_hist':   np.ndarray, shape (512,),  L1-normalized HSV 8x8x8
+    """Return all four feature representations for one image.
+
+    Returns:
+        {
+            "gemini": np.ndarray of shape (3072,),       # L2-normalized
+            "dino":   np.ndarray of shape (768,),         # L2-normalized
+            "lpips_tensor": torch.Tensor of shape (1, 3, 448, 448),  # for LPIPS pair op
+            "color_hist":   np.ndarray of shape (512,),   # 8x8x8 flattened, normalized to sum=1
+        }
     """
-
-def similarity(feat_a: dict, feat_b: dict) -> dict:
-    """Returns {'s_gemini': float, 's_dino': float, 's_lpips': float, 's_color': float}.
-    Per program.md formulas."""
-
-def compose(per_image_sims: list[dict]) -> dict:
-    """Returns {
-        'means': {'s_gemini': float, 's_dino': float, 's_lpips': float, 's_color': float},
-        'composite': float,
-    }"""
-
-def gate(candidate_means: dict, leader_means: dict, epsilon: float = 0.01) -> tuple[bool, str]:
-    """Returns (passed, reason). Reason is human-readable: which metric regressed,
-    or 'composite did not improve', or 'pass'."""
-
-def vlm_judge(image_a: PIL.Image.Image, image_b: PIL.Image.Image) -> dict:
-    """Returns {'subject':1-5, 'composition':1-5, 'lighting':1-5,
-              'palette':1-5, 'style':1-5, 'texture':1-5}.
-    Diagnostic only — never call from inside gate/compose."""
 ```
 
-### Cache layout
+```python
+def similarity(feat_a: dict, feat_b: dict) -> dict:
+    """Compute all four per-pair similarities. All in [0, 1], higher = better.
 
-`cache/originals.npz` stores the four featurization outputs per original image, keyed by `f"{relative_path}::{sha256_first_8}"`. On `featurize_original(path)`: hash the file bytes; if the key exists, load; else compute and write back. Hash-based invalidation means swapping an image at the same path correctly busts the cache.
+    Formulas:
+        s_gemini = cosine(feat_a["gemini"], feat_b["gemini"])
+                   clamped to [0, 1] (the underlying space is positive
+                   in practice; clamp defensively).
+        s_dino   = cosine(feat_a["dino"], feat_b["dino"])
+                   clamped to [0, 1].
+        s_lpips  = 1 - clip(lpips_model(feat_a["lpips_tensor"],
+                                        feat_b["lpips_tensor"]).item(), 0, 1)
+        s_color  = 1 - clip(chi2_distance(feat_a["color_hist"],
+                                          feat_b["color_hist"]) / 2.0, 0, 1)
+                   where chi2_distance(p, q) = 0.5 * sum((p-q)^2 / (p+q+eps))
+    """
+```
 
-LPIPS tensors are stored as numpy float16 arrays inside the npz and re-wrapped into torch tensors on load.
+```python
+def compose(per_image_sims: list[dict]) -> dict:
+    """Aggregate per-image similarities into a composite score.
 
-### Retry helper
+    Returns:
+        {
+            "means": {
+                "gemini": float, "dino": float,
+                "lpips": float,  "color": float,
+            },
+            "composite": float,  # mean of the four means
+        }
+    """
+```
 
-All Gemini API calls (embedding, generation, judge) go through a single `_with_retry(fn, *args, **kwargs)` helper: exponential backoff (base 2s), max 5 retries, ±25% jitter. Logs each retry to stderr. Raises after the final attempt.
+```python
+def gate(candidate_means: dict, leader_means: dict | None,
+         epsilon: float = 0.01) -> tuple[bool, str]:
+    """Anti-Goodhart promotion gate.
 
-## `harness.py` implementation contract
+    A candidate passes only if no individual metric regresses by more
+    than epsilon. If leader_means is None (no leader yet), passes
+    automatically.
+
+    Returns (passed, reason). reason is human-readable.
+    """
+```
+
+```python
+def vlm_judge(image_a: PIL.Image.Image,
+              image_b: PIL.Image.Image) -> dict[str, int]:
+    """6-axis VLM judge using gemini-3.1-flash-lite-preview.
+
+    Returns scores 1-5 on each axis:
+        {"subject": int, "composition": int, "lighting": int,
+         "palette": int, "style": int, "texture": int}
+
+    DIAGNOSTIC ONLY. Logged but never used in promotion logic.
+    """
+```
+
+### Caching
+
+Original-image features are cached in `cache/originals.npz`. Cache key
+is the file path; cache value includes the sha256 of the file bytes
+for invalidation. On every call to `featurize_original(path)` (a thin
+wrapper if you find it convenient), check the hash and recompute if
+mismatched.
+
+Cache layout:
+```python
+np.savez(
+    "cache/originals.npz",
+    paths=np.array([...]),
+    hashes=np.array([...]),
+    gemini=np.stack([...]),   # (N, 3072)
+    dino=np.stack([...]),     # (N, 768)
+    color_hist=np.stack([...]),# (N, 512)
+)
+# LPIPS tensors are recomputed from disk; they're cheap.
+```
+
+### Error handling
+
+All Gemini API calls go through one retry-with-backoff helper
+(exponential backoff, max 5 retries, jitter, surface the original
+exception on final failure). Place this helper in
+`embed_and_score.py` and reuse it from `harness.py`.
+
+## 7. `harness.py` — implementation contract
 
 ### CLI
 
 ```
-uv run harness.py --name <str>             # eval, 1 seed, promotion path
-uv run harness.py --name <str> --seeds 3   # eval, 3 seeds (re-eval mode)
-uv run harness.py --val                    # val set, no promotion, no judge
-uv run harness.py --name <str> --no-judge  # skip VLM-judge
+uv run harness.py --name <name> [--val] [--seeds N] [--no-judge]
 ```
 
-`argparse`, no extra CLI lib.
+- `--name <name>`: short identifier for the run. Required unless
+  `--val`.
+- `--val`: run on `val_images/` instead of `eval_images/`. No
+  promotion logic. Prints scores only.
+- `--seeds N`: run the full eval N times with different generation
+  seeds, report mean ± std. Default 1.
+- `--no-judge`: skip the VLM-judge call (saves ~$0.05 per
+  experiment). Default: judge runs.
 
-### Per-image flow
+### Behavior
 
-For each image in `eval_images/` (or `val_images/` if `--val`):
+For each image in the target set:
 
-1. Load original via PIL.
-2. Call `prompt_strategy.image_to_prompt(original)` → prompt string.
-3. For each seed in `[1..N]`:
-   - Generate 1024×1024 with Nano Banana 2, deterministic seed (1, 2, 3, ...).
-   - Save regen to `runs/<name>/<image_stem>__seed<k>.png`.
-   - Save the prompt to `runs/<name>/<image_stem>__seed<k>.prompt.txt`.
-   - Featurize regen, call `similarity(orig_feat, regen_feat)`.
-   - If not `--no-judge` and not `--val`: `vlm_judge(orig, regen)`, append to `runs/<name>/judge.jsonl`.
-4. Aggregate across seeds → per-image similarity dict (mean of seeds).
+1. Read original (PIL.Image).
+2. Call `prompt_strategy.image_to_prompt(image)`. Time it.
+3. Call Nano Banana 2 with the prompt:
+   - Model: `gemini-3.1-flash-image-preview`
+   - Image config: 1024×1024, default settings
+   - No aspect ratio override
+4. Save regenerated image to `runs/<name>/<image_id>.png` and the
+   prompt to `runs/<name>/<image_id>.txt`.
+5. Call `featurize` on the regenerated image. Read cached features
+   for the original.
+6. Call `similarity(orig_feat, regen_feat)`.
+7. Call `vlm_judge(orig, regen)` unless `--no-judge`.
 
-### Output
+After all images:
 
-Print a per-metric breakdown table: per-image rows + summary row, all four `s_*` columns plus a per-image composite. Then exactly these greppable lines:
+- Call `compose`.
+- Print a per-metric breakdown table:
+  ```
+  image_id    s_gemini  s_dino   s_lpips  s_color
+  001         0.812     0.701    0.688    0.767
+  002         ...
+  ...
+  ────────────────────────────────────────────────
+  mean        0.789     0.681    0.660    0.741
+  composite   0.7178
+  ```
 
-```
-composite=<value>
-gate=<pass|fail: reason>
-promoted=<yes|no>
-```
+### Promotion logic (default mode only)
 
-Drivers grep on these prefixes — keep them exact.
+- Read previous leader from `runs/leader/composite.json` (if
+  exists).
+- Call `gate(candidate_means, leader_means)`.
+- If gate passes AND `composite_candidate > composite_leader`:
+  - Print "Candidate passes single-run gate. Running 3-seed
+    re-eval..."
+  - Run the full eval 3 more times with different generation seeds
+    (seeds 1, 2, 3 — fixed for reproducibility within a session).
+  - Compute the 3-seed mean per metric.
+  - Re-run `gate` against the previous leader using the 3-seed
+    means.
+  - If gate still passes AND the 3-seed mean composite still beats
+    the leader composite:
+    - Copy `runs/<name>/` to `runs/leader/`.
+    - Write `runs/leader/composite.json`:
+      ```json
+      {
+        "name": "<name>",
+        "means": {...},
+        "composite": 0.7421,
+        "three_seed_mean": 0.7398,
+        "three_seed_std": 0.0042,
+        "timestamp": "..."
+      }
+      ```
+    - Print "PROMOTED. New leader."
+  - Else: print "REVERTED. 3-seed re-eval did not hold."
 
-### Promotion logic
+### Logbook entry
 
-If `--val`: skip everything below; never promote.
+After every run, append to `logbook.md` in the format defined in
+`program.md` (search for "Logbook entry format"). Always append,
+never overwrite.
 
-Otherwise:
+The driver agent fills in `hypothesis`, `takeaway`, and `driver`
+fields in its own session. The harness should leave them as `<TODO>`
+placeholders the driver can fill in via str_replace, OR write them
+based on environment variables `AUTORESEARCH_HYPOTHESIS` and
+`AUTORESEARCH_DRIVER` if set. Either approach works; pick one and
+document it in the file's docstring.
 
-1. Read `runs/leader/composite.json` if it exists. If not, this is the first run → auto-promote regardless.
-2. Compute candidate means and composite from the 1-seed run.
-3. Call `gate(candidate_means, leader_means)`. If fail, print `gate=fail: <reason>`, `promoted=no`, exit 0.
-4. If pass and `--seeds == 1`, automatically re-run the eval with seeds 1–3 in-process (do not re-invoke as a subprocess). Recompute means as mean across all 3 seeds × 20 images. Re-call `gate`. If still pass, proceed; if fail, print rejection reason, exit 0.
-5. Copy `runs/<name>/` artifacts to `runs/leader/`, write `runs/leader/composite.json` containing `{means, composite, name, timestamp}`.
-6. Print `promoted=yes`.
+### Output discipline
 
-### Logbook append
+The driver agent reads stdout to decide what to do next. Make output
+clear and parseable:
 
-Append one block to `logbook.md` per harness invocation (every run, promoted or not). If env vars `AUTORESEARCH_HYPOTHESIS` and `AUTORESEARCH_DRIVER` are set, fill them in; otherwise emit `<TODO: hypothesis>` and `<TODO: driver>` placeholders. Use the format defined in `program.md`. Never overwrite or rewrite older entries.
+- Print the per-metric table above.
+- Print one line: `composite=<value>`
+- Print one line: `gate=<pass|fail>` with reason on next line.
+- Print one line: `promoted=<yes|no|reverted_after_re-eval>`
 
-## Baseline `prompt_strategy.py` — ship verbatim
+These are not machine-required formats, but they should be greppable.
+
+## 8. Baseline `prompt_strategy.py` — ship verbatim
 
 ```python
-"""Baseline prompt strategy. Deliberately mediocre.
-The driver agent rewrites this file; the harness does not."""
-
-import os
+"""
+Baseline prompt strategy. The autoresearch driver agent will edit this file
+to discover better strategies. The function signature must remain stable.
+"""
 from google import genai
-import PIL.Image
+from PIL import Image
+import io
+import os
 from dotenv import load_dotenv
 
 load_dotenv()
+
 _client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
-_MODEL = "gemini-3.1-flash-lite-preview"
 
-
-def image_to_prompt(image: PIL.Image.Image) -> str:
-    """Take a reference image, return a prompt string for Nano Banana 2."""
+def image_to_prompt(image: Image.Image) -> str:
+    """Given a reference image, return a prompt for Nano Banana 2."""
+    buf = io.BytesIO()
+    image.save(buf, format="PNG")
     response = _client.models.generate_content(
-        model=_MODEL,
-        contents=[image, "Describe this image so it can be regenerated."],
+        model="gemini-3.1-flash-lite-preview",
+        contents=[
+            {"role": "user", "parts": [
+                {"text": "Describe this image so it can be regenerated."},
+                {"inline_data": {"mime_type": "image/png", "data": buf.getvalue()}},
+            ]},
+        ],
     )
     return response.text.strip()
 ```
 
-One VLM call, one trivial instruction. The driver is meant to beat this.
+This is deliberately mediocre. Expect `composite` ≈ 0.55–0.70 on a
+reasonable eval set. Beating it within the first few experiments
+should be straightforward for the driver.
 
-## Eval / val image guidance
+## 9. Eval and validation images
 
-Target: 20 eval images + 5 val images. The images are the kind used **in slides** (hero photos, illustrations, icons, etc.), not slide screenshots themselves. Recommended distribution for the 20-image eval set:
+The eval set is **20 images**, the val set is **5 images**. Once
+locked, neither is modified — every experiment is comparable only
+because the benchmark is fixed.
 
-| Count | Archetype |
-|---|---|
-| 4 | hero photography (landscape, urban, abstract, atmospheric) |
-| 3 | conceptual flat-vector illustrations |
-| 3 | isometric or hand-drawn illustrations |
-| 2 | product photography on clean background |
-| 2 | people / portraits (one solo, one group — identity stress test) |
-| 2 | photographic metaphors (cliché stock-photo style) |
-| 2 | background textures or patterns |
-| 1 | UI mockup or data viz (text-rendering stress test) |
-| 1 | icon or pictogram |
+### What the human will provide
 
-Difficulty distribution: ~6 easy, ~10 medium, ~4 hard.
+The eval set should span a range of visual archetypes the driver
+agent might be asked to reproduce. For images-used-in-slides as the
+target domain, a representative split is roughly:
 
-Val set covers the same archetypes with **different content** (eval has flat-vector "growth chart" → val has flat-vector "team meeting"). Once the human locks both sets, neither is modified for the duration of the project.
+- 4× hero photography (landscape, urban, abstract, atmospheric)
+- 3× conceptual flat-vector illustrations
+- 3× isometric or hand-drawn illustrations
+- 2× product photography on clean background
+- 2× people / portraits (one solo, one group)
+- 2× photographic metaphors (cliché stock-photo style)
+- 2× background textures or patterns
+- 1× UI mockup or data viz (text-rendering stress test)
+- 1× icon or pictogram
 
-### If `eval_images/` is empty after bootstrap
+Difficulty gradient: ~6 easy, ~10 medium, ~4 hard. The hard ones
+should be deliberately challenging (distinctive faces, dense
+composition, distinctive style) so different strategies separate
+visibly.
 
-**Stop. Ask the human. Do not scrape, generate, or auto-fill substitutes.** A wrong eval set silently invalidates every future result.
+The val set (5 images) should cover the same archetypes with
+different specific content. If eval has a flat-vector "growth chart"
+illustration, val should have a flat-vector "team meeting"
+illustration — same archetype, different content.
 
-Sample handoff message for that case:
+### If `eval_images/` is empty when you reach this step
 
-> Bootstrap is complete and smoke test 1 passed. `eval_images/` and `val_images/` are empty. Per the spec, I will not auto-fill them — silently substituting images would invalidate the benchmark. Please drop 20 reference images into `eval_images/` and 5 into `val_images/` following the archetype distribution in IMPLEMENTATION.md. Once populated, run `uv run harness.py --name baseline_smoke --no-judge` to confirm end-to-end. I will not run experiments.
+**Stop and ask the human.** Do not scrape, generate, or auto-fill
+substitutes. The eval set is the most consequential decision in the
+project; locking in random images would silently invalidate every
+experiment afterward.
 
-### Validation checks (run once images are populated)
+A reasonable hand-off message at that point:
 
-- `PIL.Image.open(path).load()` succeeds for every file.
-- Shortest side ≥ 512px.
-- No transparency (`mode in {"RGB", "L"}` after open; reject `"RGBA"` and `"P"` with alpha).
-- No sha256 collisions between `eval_images/` and `val_images/`.
-- Exact counts: 20 in eval, 5 in val.
+> The harness is built and the smoke test for `embed_and_score.py`
+> passes. I need you to populate `eval_images/` with 20 reference
+> images and `val_images/` with 5 held-out images before I can run
+> the end-to-end smoke test. See IMPLEMENTATION.md section 9 for
+> the recommended distribution. Once images are in place, I'll
+> re-run the smoke test and finish handoff.
 
-## Two-stage smoke test
+### Validation checks (run after the human populates the directories)
 
-### Test 1 — always run
+- All files in `eval_images/` and `val_images/` load with PIL.
+- All images are at least 512×512.
+- No transparent backgrounds (will confuse generation).
+- No duplicate sha256s between `eval_images/` and `val_images/`.
+- File count is exactly 20 and 5.
 
-Create a synthetic 448×448 solid red `PIL.Image`. Call `featurize(img)`. Assert the four expected keys are present and shapes match the contract. Catches: missing API key, missing weights, broken imports, device misconfiguration.
+If any check fails, stop and report.
 
-### Test 2 — only if `eval_images/` is populated
+## 10. Smoke test — required before declaring done
 
-Run `uv run harness.py --name baseline_smoke --no-judge`. Expected outcome:
+### Test 1: feature extractors load and run
 
-- Exits 0.
-- Prints all three greppable lines.
-- Self-promotes (no prior leader → auto-promote).
-- Writes `runs/leader/composite.json`.
+```bash
+uv run python -c "from embed_and_score import featurize; from PIL import Image; print(list(featurize(Image.new('RGB', (448, 448), 'red')).keys()))"
+```
 
-If Test 2 cannot be run (empty image dir), document this in the handoff message and stop.
+Expected output: `['gemini', 'dino', 'lpips_tensor', 'color_hist']`
+(in some order). This verifies that all four feature extractors
+import, weights download, and a forward pass completes
+end-to-end.
 
-## Definition of done
+If this fails, fix before proceeding. Common failure modes:
 
-1. `uv sync` succeeds on a clean checkout.
-2. `embed_and_score.py` exposes the five public functions with the documented signatures.
-3. `harness.py` runs end-to-end with a populated eval set, or stops cleanly with a clear message if the dir is empty.
-4. Smoke test 1 passes.
-5. Smoke test 2 passes, or is correctly skipped with a documented reason.
-6. `program.md` is symlinked to `AGENTS.md`.
-7. `logbook.md` exists with a single header line `# Logbook` and nothing else.
-8. `.env.example` is present; real `.env` is gitignored.
-9. Initial git commit made.
+- `GEMINI_API_KEY` missing → check `.env` and `dotenv` load.
+- HuggingFace download fails → check network, retry.
+- Torch CPU fallback path broken → make sure `device` detection
+  doesn't crash without CUDA.
 
-## Handoff message format
+### Test 2: full harness on at least one image
 
-When done, hand off with a message containing:
+If the human has populated `eval_images/` with at least one image:
 
-- **What was built:** one short paragraph.
-- **Smoke test status:** Test 1 result, Test 2 result (or reason skipped).
-- **Next action for the human:** populate image dirs (if needed), set `GEMINI_API_KEY` in `.env`, then start a driver session pointing the chosen agent at `program.md`.
-- **Deviations from this spec:** any place you deliberately diverged, with one-line justification each. If none, write "none".
+```bash
+uv run harness.py --name smoke_test --no-judge
+```
 
-## Notes for the implementation agent
+(Use `--no-judge` to keep the smoke test cheap.)
 
-- **Do not run experiments.** Beating the baseline is the driver's job, not yours.
-- **Do not modify `program.md`.** It is the driver's contract.
-- **Do not over-engineer.** Target ~500 lines total across `embed_and_score.py` and `harness.py`. If you're past 700, you're adding things that are not in the contract.
-- **Do not assume CUDA.** Test the CPU path before declaring done.
-- **Do not invent additional metrics, gates, or modes.** The set is fixed: four similarities, the gate with `epsilon = 0.01`, 3-seed re-eval, held-out val, VLM-judge diagnostic only.
-- **Cross-reference, don't duplicate.** Where `program.md` defines something (gate semantics, metric formulas, logbook format), reference it from comments and docstrings rather than restating it here or in code.
+Expected: completes without error, prints the per-metric table,
+writes `runs/smoke_test/`, and promotes itself as the first leader
+(since there's no previous leader). If this fails, fix before
+handing off.
+
+If `eval_images/` is empty, skip Test 2 and note in the handoff
+that it could not be run.
+
+## 11. Definition of done
+
+Hand off only when ALL of these are true:
+
+- [ ] `uv sync` succeeds from a clean clone.
+- [ ] Smoke test 1 passes (`featurize` returns the four expected
+      keys).
+- [ ] Smoke test 2 passes if `eval_images/` is populated
+      (full harness run completes end-to-end).
+- [ ] `program.md` is symlinked or copied to `AGENTS.md`.
+- [ ] `README.md` is in place (it should already exist; do not
+      overwrite).
+- [ ] `.env.example` exists; `.env` is in `.gitignore`.
+- [ ] `weights/`, `cache/`, `runs/` are in `.gitignore`.
+- [ ] `logbook.md` exists with a `# Logbook` header and nothing
+      else.
+- [ ] Initial git commit is made:
+      `init: bootstrap autoresearch repo`.
+
+## 12. Handoff message
+
+Write a short message to the human covering:
+
+1. What was built (one sentence).
+2. Whether smoke test 2 was run; if not, what's blocking it.
+3. What the human should do next:
+   - If `eval_images/` is empty: populate it per section 9, then
+     run `uv run harness.py --name baseline_check` to verify the
+     baseline.
+   - If `eval_images/` was populated and smoke test 2 passed: the
+     harness is ready; launch their preferred coding agent with
+     the kickoff prompt from `program.md` "Session entrypoint".
+4. Any deviations you made from this spec, with brief justification.
+
+Do not include long postambles or summaries. Two or three sentences
+plus the next-action list is plenty.
+
+---
+
+## Notes for you (the implementation agent)
+
+- **Don't run experiments.** That's the next agent's job. Your job
+  ends at handoff. If you find yourself thinking about prompting
+  strategy quality, you're out of scope.
+- **Don't change `program.md` or `README.md`.** They are inputs to
+  this build, not outputs. If you spot an inconsistency, surface it
+  in the handoff message rather than editing.
+- **Don't over-engineer.** The harness is small (target: under ~500
+  lines of Python total across both files). Resist temptations to
+  add config systems, plugin architectures, or abstractions for
+  alternative metric backends. The whole point is that the harness
+  is fixed.
+- **Do print clearly.** The driver agent reads stdout. A scrambled
+  output format is a real problem, not a cosmetic one.
+- **Do test the CPU fallback.** Many implementation agents
+  unconsciously assume CUDA. The driver may run on a laptop without
+  one.

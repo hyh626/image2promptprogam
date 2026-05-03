@@ -33,17 +33,21 @@ while looking nothing alike. A driver agent will Goodhart any single metric.
 So three additional locally-computed metrics are required, spanning roughly
 orthogonal axes from the semantic one:
 
-- **Structural:** DINOv3 ViT-B/16
-  (`facebook/dinov3-vitb16-pretrain-lvd1689m` via HuggingFace `transformers`)
+- **Structural:** DINOv2 ViT-B/14
+  (`facebook/dinov2-base` via HuggingFace `transformers`, Apache 2.0)
   — self-supervised features capturing pose, layout, appearance.
+  We use DINOv2 (Apache 2.0) rather than DINOv3 (Meta's custom
+  commercial license) for licensing simplicity; for our pair-similarity
+  use case the practical gap is small, since DINOv3's improvements are
+  mostly on dense-prediction tasks.
 - **Perceptual:** LPIPS with AlexNet backbone (`lpips` package) — texture
   and fine-detail match, trained against human similarity judgments.
 - **Color:** HSV histogram with 8×8×8 bins, chi-square distance — explicit
   palette match, catches "right object, wrong colors" failures.
 
-All four metrics are computed at canonical **448×448** (multiple of DINOv3
-patch size 16) with PIL `LANCZOS` resize, so framing/resolution differences
-don't pollute the signal.
+All four metrics are computed at canonical **448×448** (multiple of DINOv2
+patch size 14, since 448/14 = 32) with PIL `LANCZOS` resize, so
+framing/resolution differences don't pollute the signal.
 
 CPU-only execution must work — no GPU required. Per 20-image experiment,
 local metrics combined add ~10s on CPU; the bottleneck is the ~3–5 minutes
@@ -56,7 +60,7 @@ Per (original, regenerated) pair, four similarities each in [0, 1] with
 higher = better:
 
 - `s_gemini` = cosine of Gemini embeddings
-- `s_dino` = cosine of DINOv3 CLS-token features
+- `s_dino` = cosine of DINOv2 CLS-token features
 - `s_lpips` = 1 − clip(lpips_distance, 0, 1)
 - `s_color` = 1 − clip(chi2_distance / 2.0, 0, 1) where chi-square is
   `0.5 * sum((p−q)² / (p+q+eps))`
@@ -130,7 +134,7 @@ Per-agent context-file setup table:
 
 Logbook entries record a `driver:` field for cross-agent comparisons.
 Sandbox/permission needs: network egress to `generativelanguage.googleapis.com`
-and `huggingface.co` (DINOv3 download, first run only); read/write in working
+and `huggingface.co` (DINOv2 download, first run only); read/write in working
 dir; permission to run `git` and `uv`.
 
 ## The two MD files
@@ -167,13 +171,13 @@ spec for shared definitions; only adds what's specific to building.
 Sections to include:
 - What you're building (one paragraph)
 - Stack (model table)
-- Why these specific local metrics (DINOv3 + LPIPS + HSV justifications, including the orthogonal-axes argument)
+- Why these specific local metrics (DINOv2 + LPIPS + HSV justifications, including the orthogonal-axes argument and the DINOv2-vs-DINOv3 licensing rationale)
 - Local-metric compute requirements (per-image latency on CPU; dominated by API generation, not local compute; cache strategy)
 - Repo layout to create (full file/dir list)
 - Numbered build sequence: `uv init` → `pyproject.toml` → `uv sync` → `.gitignore` → `.env.example` → implement `embed_and_score.py` → implement `harness.py` → ship baseline `prompt_strategy.py` → set up image dirs → symlink `program.md` to `AGENTS.md` → run smoke tests → initial git commit → handoff
 - `pyproject.toml` content (Python 3.11+, deps: `google-genai`, `torch`, `transformers`, `lpips`, `pillow`, `numpy`, `scipy`, `python-dotenv`)
 - `embed_and_score.py` implementation contract:
-  - Module-level setup: dotenv load, Gemini client, DINOv3 model + processor with `cache_dir="weights/"`, LPIPS model, device detection (CPU fallback must work)
+  - Module-level setup: dotenv load, Gemini client, DINOv2 model + processor (`facebook/dinov2-base`) with `cache_dir="weights/"`, LPIPS model, device detection (CPU fallback must work)
   - Canonical 448×448 LANCZOS preprocessing applied everywhere
   - Public functions with full signatures and return shapes:
     - `featurize(image)` returning `{"gemini": (3072,), "dino": (768,), "lpips_tensor": (1,3,448,448), "color_hist": (512,)}`
@@ -202,7 +206,7 @@ Sections to include:
 ## Specific design decisions to preserve in both docs
 
 - Driver agent ≠ inner VLM. State this explicitly.
-- 448×448 canonical resolution everywhere (DINOv3 patch-size compat).
+- 448×448 canonical resolution everywhere (DINOv2 patch-size compat: 448/14=32).
 - `epsilon = 0.01` for the no-regression gate.
 - 3-seed re-eval with fixed seeds 1, 2, 3.
 - VLM-judge is logged but never optimized — explain why (feedback loop).
