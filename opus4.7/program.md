@@ -1,225 +1,329 @@
-# Autoresearch: Image Reproduction via Prompt Strategy
+# program.md — Image → Prompt → Image autoresearch
 
-You are a driver agent running an autoresearch loop. Your job is to discover a prompting strategy that causes a text-to-image model to faithfully reproduce a reference image. **The harness already exists. You do not modify it.** You edit one file (`prompt_strategy.py`), run the benchmark, read the score, and iterate.
+You are an autonomous research agent driving an experimental loop. Your
+job is to discover prompting strategies that, given an input image,
+produce a text prompt which causes an image generator to reproduce that
+image as faithfully as possible.
 
-Comparability across experiments depends on the harness being unchanging. Touching it invalidates every prior score.
+You will iterate by editing a single file, running a fixed evaluation,
+reading the score, and deciding whether to keep or discard your change.
+Keep going until told to stop.
 
-## Setup
+The harness has already been built. You operate it; you do not modify
+it. If you find yourself wanting to change `harness.py` or
+`embed_and_score.py`, stop — you are out of scope.
 
-### Models
+This document is **agent-agnostic**: it should drive equally well
+whether you are running inside Claude Code, OpenAI Codex CLI, Gemini
+CLI, OpenCode, Aider, Cursor, or any other coding agent that can read
+files, edit files, run shell commands, and use git.
 
-| Role | Model |
-|---|---|
-| Inner VLM (writes prompt from image, called inside `prompt_strategy.py`) | `gemini-3.1-flash-lite-preview` |
-| Image generator (called by harness) | `gemini-3.1-flash-image-preview` (Nano Banana 2), 1024×1024, defaults |
-| Semantic embedding (orig + regen, shared 3072-d space) | `gemini-embedding-2-preview` |
+The methodology follows Andrej Karpathy's
+[autoresearch](https://github.com/karpathy/autoresearch) pattern.
 
-### Driver agent vs. inner VLM
+---
 
-The **driver** is the coding agent reading this document — Claude Code, Codex CLI, Gemini CLI, OpenCode, Aider, or Cursor. It edits `prompt_strategy.py` and runs experiments.
+## The setup
 
-The **inner VLM** is always `gemini-3.1-flash-lite-preview`. It runs inside `prompt_strategy.image_to_prompt(...)` and turns a reference image into a generation prompt.
+| Role | Model / Method | What it does |
+|---|---|---|
+| **VLM** (called from `prompt_strategy.py`) | `gemini-3.1-flash-lite-preview` (Gemini API) | Looks at the input image and produces a prompt |
+| **Image generator** (called by harness) | `gemini-3.1-flash-image-preview` / Nano Banana 2 (Gemini API) | Generates an image from the prompt |
+| **Semantic similarity** (harness) | `gemini-embedding-2-preview` (Gemini API) | Multimodal embedding — semantic content match |
+| **Structural similarity** (harness) | DINOv2 ViT-B/14 (local, Apache 2.0) | Self-supervised vision features — pose, layout, appearance |
+| **Perceptual similarity** (harness) | LPIPS with AlexNet backbone (local) | Perceptual texture / fine-detail match |
+| **Color similarity** (harness) | HSV histogram, chi-square distance (local) | Color palette match |
 
-These are different. The driver does not generate prompts directly; `prompt_strategy.py` does. The driver designs strategies *for* `prompt_strategy.py`.
+**You (the driver) are independent of the inner VLM.** You might be
+Claude, GPT-5, or Gemini Pro driving this loop; the inner VLM that
+writes prompts inside `prompt_strategy.py` is always Gemini Flash-Lite.
+Don't confuse the two roles.
 
 ## Repo layout
 
 ```
-.
-├── program.md              # this file (you read this)
-├── prompt_strategy.py      # YOU EDIT THIS
-├── harness.py              # do not modify
-├── embed_and_score.py      # do not modify
-├── eval_images/            # 20 reference images, do not modify
-├── val_images/             # 5 held-out images, do not modify
-├── runs/                   # per-experiment artifacts (auto-created)
-│   ├── <name>/             # one dir per --name
-│   └── leader/             # current best, gate-passed
-├── cache/                  # original-image features, do not delete
-├── weights/                # DINOv3 weights cache
-├── logbook.md              # YOUR memory across runs
-├── pyproject.toml
-└── .env                    # GEMINI_API_KEY
+prompt_strategy.py    ← the ONLY file you edit
+harness.py            ← runs the eval loop. DO NOT MODIFY.
+embed_and_score.py    ← four similarity metrics + compositing. DO NOT MODIFY.
+eval_images/          ← 20 fixed reference images. DO NOT MODIFY.
+val_images/           ← 5 held-out images. DO NOT MODIFY.
+cache/                ← cached features for original images
+runs/                 ← per-experiment artifacts
+weights/              ← downloaded local model weights
+logbook.md            ← every experiment appended here
+program.md            ← this file
 ```
-
-You edit only `prompt_strategy.py` and `logbook.md`. You may read everything else. You modify nothing else.
 
 ## The single file you edit
 
-`prompt_strategy.py` exposes one public function:
+`prompt_strategy.py` exposes one function whose signature is fixed:
 
 ```python
 def image_to_prompt(image: PIL.Image.Image) -> str:
-    """Take a reference image, return a prompt string for Nano Banana 2."""
+    """Given a reference image, return a prompt for Nano Banana 2."""
 ```
 
-The harness imports this, passes each eval image, takes the returned string, and feeds it to the image generator. Everything you experiment with — single-call vs decomposition, output format, thinking levels, few-shot, negative prompts, iterative refinement — happens *inside this function*. Its signature is fixed; its body is yours.
+Everything inside this function is fair game: system prompt, user
+prompt, number of VLM calls, iterative refinement against draft
+generations, decomposition into subject/style/composition fields,
+few-shot examples, thinking levels, etc. The function may make
+multiple API calls internally.
 
-## Running experiments
+## Running an experiment
 
 ```bash
-uv run harness.py --name <experiment_name>             # eval, 1 seed
-uv run harness.py --name <experiment_name> --seeds 3   # eval, 3 seeds (re-eval)
-uv run harness.py --val                                # held-out val, no promotion
-uv run harness.py --name <experiment_name> --no-judge  # skip VLM-judge to save calls
+uv run harness.py --name <short_descriptive_name>
 ```
 
-Flags:
-- `--name` — directory under `runs/` for artifacts; required for the promotion path.
-- `--val` — runs against `val_images/`; never promotes; cheaper sanity check.
-- `--seeds N` — number of generation seeds per image (fixed: 1, 2, 3, ...).
-- `--no-judge` — skips the VLM-judge call to save API budget.
+For each of the 20 images in `eval_images/`, the harness:
+
+1. Calls `image_to_prompt(image)` to get a prompt.
+2. Calls Nano Banana 2 once with that prompt.
+3. Computes four similarity signals between the original and the
+   regenerated image.
+4. Combines them into the composite score (defined below).
+5. Decides whether to promote against the current leader.
+6. Appends a logbook entry.
+
+Per experiment: ~3–5 minutes wall clock, $0.10–$0.30 in API spend.
+
+Other CLI flags:
+
+```bash
+uv run harness.py --val           # run on val_images/, no promotion
+uv run harness.py --name <n> --seeds N   # run N seeds, report mean ± std
+```
+
+---
 
 ## The metric
 
 ### Per-pair similarities (each in [0, 1], higher = better)
 
-| Name | Formula |
+| Signal | Computation |
 |---|---|
-| `s_gemini` | cosine of Gemini multimodal embeddings |
-| `s_dino` | cosine of DINOv3 ViT-B/16 CLS-token features |
-| `s_lpips` | `1 − clip(lpips_distance, 0, 1)` (AlexNet backbone) |
-| `s_color` | `1 − clip(chi2_distance / 2.0, 0, 1)`; HSV 8×8×8 histogram; chi² = `0.5 * Σ((p−q)² / (p+q+ε))` |
+| `s_gemini` | cosine of `gemini-embedding-2-preview` vectors |
+| `s_dino` | cosine of DINOv2 ViT-B/14 CLS-token features |
+| `s_lpips` | `1 - clip(lpips_distance, 0, 1)` (LPIPS, AlexNet backbone) |
+| `s_color` | `1 - clip(chi_square / 2.0, 0, 1)` (HSV histogram, 8×8×8 bins) |
 
-All features are computed at canonical **448×448 LANCZOS** (multiple of DINOv3 patch size 16). Same input crop for all four metrics.
+All four are computed at canonical 448×448 so framing/resolution
+differences don't pollute the signal.
 
 ### Composite
 
-Composite = mean of the four per-metric means across the 20 eval images.
+For each of the 20 eval images, compute all four similarities. Then:
 
-### Promotion gate
+```
+mean_signal[m]  =  mean over 20 eval images of  s_m
+composite       =  mean across the four metrics
+```
 
-A candidate is promoted only if **both** rules hold against the current leader:
+`composite` is the number you primarily try to improve. But it is not
+the only thing the gate checks.
 
-1. **No-regression:** for each metric `m`, `mean_m(candidate) ≥ mean_m(leader) − epsilon` with `epsilon = 0.01`. If any single metric drops by more than 0.01, the candidate is rejected even if composite improved. This defeats the most common failure mode: trading one signal for another.
-2. **Improvement:** `composite(candidate) > composite(leader)`.
+### Anti-Goodhart promotion gate
+
+A new candidate is **promoted** (becomes the new leader) only if BOTH:
+
+1. **No-regression rule:** for each individual metric m,
+   `mean_signal_candidate[m] >= mean_signal_leader[m] - 0.01`.
+2. **Improvement rule:** `composite_candidate > composite_leader`.
+
+If any single dimension drops by more than 0.01, the candidate is
+rejected even if `composite` improved. This defeats the most common
+failure mode: boost one signal by abandoning another.
 
 ### 3-seed re-eval
 
-When a 1-seed candidate passes the gate, the harness automatically re-runs the full eval at fixed seeds 1, 2, 3. The 3-seed mean must still pass both rules; otherwise revert to leader. This filters single-seed luck.
+When a candidate passes the gate on a single run, the harness
+automatically re-runs the full eval 3 more times with different
+generation seeds. The 3-seed mean must still pass the gate.
+Otherwise, revert.
 
 ### Held-out validation
 
-`val_images/` contains 5 images covering the same archetypes as eval, with different content. Run `uv run harness.py --val` every ~10 promoted leaders. If `composite_eval` climbs while `composite_val` stays flat or drops, you are overfitting the eval set. Stop and rethink.
+`uv run harness.py --val` runs the full pipeline on `val_images/`
+without promotion logic. Run this every ~10 promoted leaders. If
+`composite_eval` is climbing but `composite_val` is flat or dropping,
+you are overfitting to the eval set — back off and try something
+qualitatively different.
 
-### VLM-judge — diagnostic only, NOT optimized against
+### Diagnostic, not optimized: VLM judge
 
-A 6-axis Gemini-Flash-Lite judge scores each (orig, regen) pair on **subject identity, composition, lighting, palette, style, texture**, each 1–5. It is logged per pair for diagnostic insight only. **Do not optimize against it.** The inner VLM is also Gemini; optimizing against a Gemini-judged score creates a feedback loop that rewards prompts the model family happens to find pretty. The four computed metrics above are the actual objective. The judge's value is post-hoc: when a metric moves, the judge axes help you tell *which kind* of failure it was.
+The harness also logs a 6-axis VLM-judge score (subject identity,
+composition, lighting, color palette, style, texture; each 1–5) per
+pair. **Logged for inspection only.** Do not optimize against it;
+treating it as a target creates a feedback loop with the prompting
+model.
+
+---
 
 ## Workflow per experiment
 
-**1. Re-read `logbook.md` before forming a new hypothesis.**
+1. **Re-read `logbook.md`** before forming a new hypothesis. This is
+   the single most important instruction in the loop. Without it,
+   drivers drift into local search and forget what's already been
+   tried.
+2. **Hypothesis.** Write one sentence describing what you are trying
+   and why. "Add explicit color palette extraction step before main
+   description" is good. "Try better prompt" is not.
+3. **Edit** `prompt_strategy.py`.
+4. **Run** `uv run harness.py --name <name>`.
+5. **Read** the per-metric breakdown, not just `composite`. If `s_dino`
+   jumped but `s_gemini` dropped, that's a signal about what your
+   change actually did.
+6. **Decide** based on the harness output:
+   - Gate passes AND composite improves → harness runs the 3-seed
+     re-eval. If still passes, commit the file with message
+     `leader: <name> = <composite>`.
+   - Otherwise → `git checkout prompt_strategy.py` and try something
+     else.
+7. **Log** the entry in `logbook.md`. Append, never overwrite.
+8. **Repeat.** Aim for one experiment per ~10 minutes wall clock.
 
-This is the single most important instruction in this document. The logbook is your only persistent memory across runs. Most failure modes — repeating an already-tried experiment, drifting along one axis without checking the gate, losing track of which dimension the leader has stopped improving on — come from skipping this step. Read the whole logbook. Then form your hypothesis.
-
-2. Write a one-line hypothesis: what change, what metric you expect to move, why. Be specific (e.g., "explicit color-palette enumeration should raise `s_color` ≥ 0.02 without dropping `s_dino`").
-
-3. Edit `prompt_strategy.py`. Keep diffs small. One change per experiment.
-
-4. Set `AUTORESEARCH_HYPOTHESIS` and `AUTORESEARCH_DRIVER` env vars so the harness fills the logbook entry automatically.
-
-5. Run `uv run harness.py --name <descriptive_name>`. Names are cheap — use long ones.
-
-6. Read the per-metric breakdown. Look at all four metrics and per-image rows, not just composite. Greppable lines: `composite=`, `gate=`, `promoted=`.
-
-7. Append a logbook entry: hypothesis, diff summary, per-metric numbers, gate result, takeaway. Be honest in the takeaway — especially when the result was negative.
-
-8. After every ~10 promoted leaders, run `uv run harness.py --val` to confirm gains generalize.
+Prefer **qualitatively different** experiments over local optimization
+of any single approach. The biggest failure mode is the agent walking
+down one direction (more decomposition, more decomposition) instead of
+jumping to a different family (iterative refinement, few-shot, terse
+prompts). Diversity is a goal, not a side effect.
 
 ## Budget guardrails
 
-- **Per experiment:** one full eval ≈ 20 images × ~10s generation ≈ 3–5 min wall time. With `--seeds 3`, triple it.
-- **Per session:** cap at 50 experiments. Past that you are almost certainly Goodharting.
-- **VLM-judge** is the most expensive non-generation cost. Use `--no-judge` while iterating fast on a known direction; re-enable for the runs you're going to write up.
-- API spend is dominated by Nano Banana 2 generation, not by the VLM or embedding calls.
+- **Per experiment:** 20 input images × your VLM calls per image, plus
+  20 generations and 80 local feature extractions. If your strategy
+  needs more than ~5 VLM calls per image, the gain has to be
+  substantial to justify it.
+- **Per session:** stop after 50 experiments and write a session
+  summary.
 
-## What's worth exploring
+## What's worth exploring (not exhaustive)
 
-| Axis | Examples |
-|---|---|
-| Output format | comma-separated tags; structured JSON-like schema; long prose; bullet list |
-| Decomposition | one VLM call vs. separate calls for subject / setting / style / palette |
-| Iterative refinement | first-pass description → critique → revised prompt |
-| Prompt length | 20 words vs. 80 vs. 300 |
-| Negative prompts | append "avoid: blur, watermark, text artifacts" |
-| Few-shot | inline example pairs of (image-description → ideal prompt) |
-| Thinking levels | enable/disable model thinking; vary thinking budget |
-| Style vs. content tradeoff | per-metric inspection: did `s_dino` (structure) win at the expense of `s_color` (palette)? |
-
-Prefer **qualitatively different** experiments over local tweaks of the same idea. The leader can drift far along one direction (more verbose, more structured, etc.) and you'll get diminishing-then-negative returns without noticing. If your last 5 experiments all touched the same axis, switch axes.
+- **Output format:** free-form vs. structured (subject / style /
+  composition / lighting / palette / camera).
+- **Decomposition:** multiple VLM calls each focused on one aspect,
+  merged.
+- **Iterative refinement:** generate a draft, embed it, compare to the
+  original, ask the VLM what's missing, revise the prompt, regenerate.
+  Costs more per experiment — measure whether it pays.
+- **Prompt length:** very short evocative prompts vs. dense literal
+  ones. Nano Banana 2 has strong world knowledge; sometimes short wins.
+- **Negative prompts** / what to avoid.
+- **Few-shot exemplars** in the system prompt.
+- **Thinking level** on the inner VLM (`minimal`, `low`, `medium`,
+  `high`) — Gemini-specific feature, controls reasoning effort.
+- **Style-vs-content tradeoff:** if `s_dino` is high but `s_gemini` is
+  low, you're matching layout/texture but missing subject identity. If
+  reverse, you're describing what's there but not how it looks.
 
 ## What NOT to do
 
-- Do not modify `harness.py`, `embed_and_score.py`, the image dirs, or anything in `cache/` — invalidates all prior scores.
-- Do not change models, model parameters, or generation config. The harness fixes them deliberately.
-- Do not memorize the eval set in `prompt_strategy.py` (per-filename branching, hardcoded captions). It defeats validation.
-- Do not optimize against the VLM-judge axes. Diagnostic only.
-- Do not promote on a single lucky seed; trust the 3-seed re-eval.
-- Do not delete or rewrite logbook entries. Append-only.
-- Do not chase a metric that's already at 0.95+; the headroom is in the laggards.
+- Do not modify `harness.py`, `embed_and_score.py`, `eval_images/`, or
+  `val_images/`. These define the benchmark.
+- Do not change the image generator model, the embedding model, the
+  local metric models, or the canonical 448×448 resolution.
+  Comparability across experiments depends on these being fixed.
+- Do not memorize the eval set. Hardcoding references to specific
+  eval images is cheating; held-out val will catch it.
+- Do not optimize against the VLM-judge scores. They are diagnostic
+  only.
+- Do not chase a single lucky run. The 3-seed re-eval gate exists for
+  a reason.
 
 ## Logbook entry format
 
-Append one block per run, newest at bottom:
-
 ```
-## <experiment_name> — <YYYY-MM-DD HH:MM>
-driver: <claude-code | codex | gemini-cli | opencode | aider | cursor>
-hypothesis: <one line>
-diff: <one-line summary of what changed in prompt_strategy.py>
-seeds: <1 | 3>
-metrics:
-  s_gemini: <mean> | s_dino: <mean> | s_lpips: <mean> | s_color: <mean>
-  composite: <mean>
-gate: <pass | fail: reason>
-promoted: <yes | no>
-takeaway: <one or two sentences, honest>
+### <name> — <YYYY-MM-DD HH:MM>
+- driver: <e.g. claude-opus-4.7 via claude-code, or gpt-5 via codex>
+- hypothesis: <one sentence>
+- composite: 0.7421
+- s_gemini: 0.812 | s_dino: 0.701 | s_lpips: 0.688 | s_color: 0.767
+- gate vs leader: pass | fail (<which metric regressed by how much>)
+- 3-seed re-eval: 0.7398 ± 0.0042   (only if promoted)
+- val composite: 0.7301              (only if --val was run)
+- wall_clock: 4.2 min
+- est_cost_usd: 0.18
+- takeaway: <one or two sentences>
+- promoted: yes | no
 ```
 
-The `driver:` field exists so cross-agent comparisons stay clean.
+The `driver` field is important: it lets future readers (or
+meta-experiments) compare how different driver agents explored the
+space on the same harness.
 
 ## Stopping
 
-When you stop (session cap, exhausted ideas, or human says so), append a session summary to `logbook.md`:
+When the user says stop, or after 50 experiments, append a "Session
+summary" section to `logbook.md` with:
 
-```
-## SESSION SUMMARY — <YYYY-MM-DD>
-top 3 by composite (with val): <names + numbers>
-what worked: <2–4 bullets>
-promising but failed gate or val: <2–4 bullets>
-three concrete next experiments: <numbered>
-```
+1. Top 3 strategies by `composite`, with their per-metric breakdown
+   and `val composite` for honesty.
+2. What worked consistently across all four metrics.
+3. What looked promising on `composite` but failed the gate or
+   regressed on val.
+4. Three concrete next experiments worth running with more time.
 
-The "three concrete next experiments" matters. The next session reads it as part of step 1.
+---
 
 ## Multi-CLI compatibility
 
-The driver loop is agent-agnostic: read files, edit files, run shell, run git. No tool-specific instructions, slash commands, MCP servers, or persistent agent memory. `logbook.md` is the only memory.
+The loop assumes the agent has only these capabilities, which every
+modern coding agent provides:
 
-### Per-agent setup
+- Read files in the working directory.
+- Edit files (at minimum `prompt_strategy.py` and `logbook.md`).
+- Run shell commands (`uv run`, `git`, basic POSIX).
+- Use git (`checkout`, `commit`, `diff`).
+
+It does NOT assume any specific tool name, slash command, IDE
+integration, MCP server, or persistent agent memory. `logbook.md` is
+the memory.
+
+### Per-agent context-file setup (one-time)
+
+Symlink `program.md` to whatever filename your agent auto-loads:
 
 | Agent | Auto-loaded file | Setup |
 |---|---|---|
 | Claude Code | `CLAUDE.md` | `ln -s program.md CLAUDE.md` |
-| Codex CLI | `AGENTS.md` | `ln -s program.md AGENTS.md` |
+| OpenAI Codex CLI | `AGENTS.md` | `ln -s program.md AGENTS.md` |
 | Gemini CLI | `GEMINI.md` | `ln -s program.md GEMINI.md` |
 | OpenCode | `AGENTS.md` | `ln -s program.md AGENTS.md` |
-| Aider | none | `--read program.md` on launch |
+| Aider | none auto-loaded | pass `--read program.md` on launch |
 | Cursor | `.cursorrules` | `ln -s program.md .cursorrules` |
 
-### Sandbox / permissions
+`AGENTS.md` is shipped pre-symlinked, which covers Codex, OpenCode,
+and several other agents that follow the AGENTS.md convention.
 
-The driver needs:
-- Network egress to `generativelanguage.googleapis.com` (Gemini API) and `huggingface.co` (DINOv3 weights, first run only).
-- Read/write in working directory.
-- Permission to run `git` and `uv`.
+### Sandboxing & permissions
 
-### Session entrypoint kickoff prompt
+The loop needs:
 
-Paste this as the first user message of a fresh session:
+- **Network egress** to `generativelanguage.googleapis.com` (Gemini
+  API).
+- **Read/write** within the working directory.
+- **Permission to run** `git` and `uv`.
 
-> You are running an autoresearch loop on prompt strategies for image reproduction. Read `program.md` first. Then read `logbook.md` in full. Then propose your first experiment as a one-line hypothesis, edit `prompt_strategy.py`, and run the harness. Iterate.
+Whitelist these explicitly when launching the agent if it asks.
+
+### Session entrypoint
+
+Same regardless of which CLI:
+
+```
+> Read program.md and the latest entries in logbook.md.
+> Then start a new session — aim for at least 20 experiments,
+> prioritizing qualitatively different strategies over local
+> optimization. Re-read logbook.md before each new hypothesis.
+> Record your driver model in each logbook entry.
+```
+
+Paste that as your first message.
 
 ### Cross-agent meta-experiment (optional)
 
-To compare driver agents directly: create one git branch per driver (`driver/claude-code`, `driver/codex`, etc.) sharing the same `eval_images/`, `val_images/`, and starting `prompt_strategy.py`. Each driver runs an independent session. Compare top composites, val performance, and number of promotions per 50-experiment session. The `driver:` field in logbook entries makes the comparison clean.
+Because `program.md` is fixed and `logbook.md` records the driver,
+running the same spec under different agents and comparing outcomes
+is a legitimate meta-experiment. Use a separate git branch per
+driver (`session/claude-opus`, `session/gpt-5`, `session/gemini-pro`)
+so the per-driver logbooks and leader trajectories don't interleave.
