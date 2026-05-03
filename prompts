@@ -2,4 +2,4 @@ can you summarize what does https://github.com/karpathy/autoresearch do, and how
 this is very interesting, I want to do an exploration how can construct a prompt from an image so the image can be more likely be reproduced by an image generation model, do you think it's feasible for this?
 i want to focus on the modern vlm first, how about we use gemini embeddings to measure similarity and gemini 3.1 flash lite as the vlm and one gemini nano banana model as the image generator for this experiment, can you construct a plan for this ?
 can you propose some solution to mitigate the limitation of using Multimodal embeddings will only capture semantic meaning
-put these to a program.md so {code agent} can implement this based on
+can you summarize above conversation to write 2 md files, a self contained program.md only introduces how to use the repo to do auto research(assuming the harness  has already been implemented), another md file for implementation agent to implement this harness which can refer to program.md but should include all information we already discussed here
