@@ -1,0 +1,244 @@
+I want you to create two Markdown files for a repo.
+
+Context:
+I’m exploring an image-prompt autoresearch system inspired by Andrej Karpathy’s `autoresearch` repo. In Karpathy’s repo, an agent edits a constrained research surface, runs short experiments, evaluates a metric, keeps improvements, logs results, and repeats. I want to adapt that idea from ML training-code search to prompt search for image reproduction.
+
+My research goal:
+Given a target image and a fixed image generation model, can an autonomous VLM-driven agent iteratively construct and refine prompts that make the fixed image generator produce images more visually similar to the target image?
+
+Important qualification:
+The goal is not exact pixel-perfect reconstruction. The realistic goal is improved visual similarity, prompt construction rule discovery, and understanding the limits of prompt-only image reproduction.
+
+System components I want to assume:
+- Gemini embeddings are used as the main similarity/reward signal.
+- Gemini 3.1 Flash Lite is used as the VLM analyst / prompt optimizer.
+- A Gemini “Nano Banana” image generation model is used as the fixed image generator.
+- The generator should be treated as a black-box environment.
+- The harness is responsible for running the experiment loop, generation, scoring, logging, and beam search.
+
+High-level roles:
+- Gemini embeddings: image-image similarity scoring, optionally text-image similarity.
+- Gemini 3.1 Flash Lite: target image understanding, structured decomposition, critique of target vs generated image, prompt mutation, and rule extraction.
+- Gemini Nano Banana: fixed image generator whose outputs are evaluated.
+
+Core experiment loop:
+1. Start with a target image.
+2. Use the VLM to produce a dense caption, structured visual decomposition, and reproduction-focused description.
+3. Build initial prompt candidates.
+4. Generate images from the fixed generator.
+5. Score generated images against the target.
+6. Keep top prompts.
+7. Ask the VLM to compare target vs generated images and propose concrete prompt revisions.
+8. Generate and score revised prompts.
+9. Repeat using beam search.
+10. Re-evaluate top prompts with multiple seeds.
+11. Produce final reports and discovered prompt-construction rules.
+
+Prompt representation:
+Use an internal structured prompt schema, not only freeform text. Include fields such as:
+- subject
+- scene
+- composition
+- style
+- lighting
+- color_palette
+- camera
+- materials_textures
+- important_objects
+- spatial_relations
+- negative_constraints
+
+The system should compile this structured schema into the final prompt string for the image generator.
+
+Search algorithm:
+Use beam-style iterative search:
+- Keep top B prompts from previous round.
+- For each prompt, ask the VLM for K revisions.
+- Generate images for candidates.
+- Score candidates.
+- Keep top B overall.
+Suggested defaults:
+- beam width B = 3
+- mutations per prompt K = 4
+- one generated image per candidate during early search
+- 3–5 seeds for top candidates near the end
+- max iterations around 8 for a minimal prototype
+
+Scoring:
+Do not rely only on a single whole-image multimodal embedding because it mostly captures semantic meaning and may miss layout, object count, style, color, local details, and text.
+
+Use a composite evaluator:
+- whole-image Gemini embedding similarity
+- region-aware embedding similarity using full image, center crop, and grid crops
+- VLM structured judge scores for subject, composition, style, color/lighting, and detail match
+- optional deterministic diagnostics: color palette distance, brightness/contrast/saturation, OCR/text match, object count, spatial relation match, perceptual metrics such as LPIPS/SSIM/DINO if available
+
+Recommended first scoring formula:
+final_score =
+  0.45 * whole_image_embedding_similarity
++ 0.25 * region_embedding_similarity
++ 0.30 * vlm_structured_judge_score
+
+Use embeddings for broad recall and VLM pairwise/structured judging for precision. A practical pipeline:
+1. Generate many candidates.
+2. Rank by embedding score.
+3. Take top candidates.
+4. Rerank with region scoring and VLM judge.
+5. Keep best prompts.
+
+VLM structured judge should output JSON like:
+{
+  "subject_match": 1-5,
+  "composition_match": 1-5,
+  "style_match": 1-5,
+  "color_lighting_match": 1-5,
+  "detail_match": 1-5,
+  "main_differences": ["..."],
+  "recommended_prompt_edits": ["..."]
+}
+
+Logging:
+Every candidate evaluation should be logged as JSONL with:
+- target image id/path
+- iteration
+- parent prompt id
+- prompt id
+- structured prompt object
+- flattened prompt text
+- negative prompt if used
+- generator parameters
+- seed
+- generated image path
+- whole-image embedding score
+- region embedding score
+- VLM judge score
+- final score
+- critique
+- mutation rationale
+- whether it was kept
+- latency/cost if available
+
+Final outputs:
+For each target:
+- baseline prompt and score
+- best prompt and score
+- best generated image path
+- score trajectory
+- failure analysis
+- discovered prompt rules
+
+Across targets:
+- category-level performance
+- common failure modes
+- prompt fields that helped most
+- comparison of scoring methods
+- generalization of prompt rules
+
+Experiment phases:
+Phase 0: API and metric sanity checks
+- Test embeddings on related/unrelated image pairs.
+- Verify VLM captions and critiques are useful.
+- Verify generator responds to prompt changes.
+
+Phase 1: single-image optimization prototype
+- One target image.
+- Debug the full loop.
+- Track score trajectory and prompt mutations.
+
+Phase 2: small benchmark set
+- 20–50 target images.
+- Categories: portrait, landscape, product/object, interior, stylized illustration, multi-object scene, text-heavy/dense layout.
+- Analyze which types are easiest or hardest.
+
+Phase 3: rule discovery/generalization
+- Ask VLM to summarize which prompt edits helped.
+- Identify reusable prompt patterns.
+- Evaluate on held-out images.
+
+Ablations to include:
+- VLM initialization vs no VLM initialization
+- freeform prompt vs structured prompt
+- critique-guided mutation vs blind mutation
+- single-seed vs multi-seed optimization
+- embeddings-only ranking vs embeddings + VLM judge
+- whole-image embeddings vs region-aware embeddings
+- compact prompt vs detailed prompt
+
+Important risks:
+- Same-family bias from using Gemini for captions, embeddings, and judging.
+- Embeddings may miss spatial precision.
+- Prompt-only control has a ceiling.
+- Exact text, logos, identity, and dense layout are hard.
+- Cost can grow quickly, so use cheap scoring first and expensive judging only for top candidates.
+
+Implementation repo structure suggestion:
+image_prompt_search/
+  configs/
+    default.yaml
+  data/
+    targets/
+  src/
+    embeddings.py
+    vlm.py
+    generator.py
+    prompt_schema.py
+    prompt_builder.py
+    scorer.py
+    search.py
+    runner.py
+    logger.py
+    analysis.py
+  experiments/
+    exp_single_image.py
+    exp_benchmark.py
+    exp_ablation.py
+  outputs/
+    runs/
+
+Now create two Markdown files:
+
+File 1: `program.md`
+Purpose:
+This should be self-contained and written for the autoresearch agent/researcher that will use the already-implemented harness. It should not explain how to implement the harness. It should explain how to run image-prompt autoresearch using the repo.
+
+Requirements for `program.md`:
+- Explain the mission.
+- Explain the fixed roles of target image, generator, VLM optimizer, and similarity evaluator.
+- Explain the experiment loop.
+- Explain what the agent is allowed to change: prompts, structured prompt fields, mutation strategy notes, experiment configs if exposed.
+- Explain what the agent should not change: core harness, scoring code, API wrappers, target images, generator model, metric definitions, unless explicitly instructed.
+- Explain how to run baseline, iterative search, and final evaluation, using plausible commands such as:
+  - `python -m image_prompt_search.runner --config configs/default.yaml --target data/targets/example.png`
+  - `python -m image_prompt_search.analysis --run outputs/runs/<run_id>`
+- Explain how to interpret outputs.
+- Explain how to log results.
+- Explain acceptance/rejection policy for prompt changes.
+- Explain how to write the final research report.
+- Include guidance about not overfitting to one lucky seed.
+- Include guidance about prompt-only limitations.
+
+File 2: `implementation_harness_spec.md`
+Purpose:
+This should be written for a coding/implementation agent that needs to build the harness. It can refer to `program.md`, but it must include all the implementation-relevant design details from this prompt.
+
+Requirements for `implementation_harness_spec.md`:
+- Include project overview and architecture.
+- Include module-by-module responsibilities.
+- Include data models / schemas for structured prompts, candidate records, score records, VLM critiques, run configs.
+- Include the full experiment loop.
+- Include API wrapper expectations for Gemini embeddings, Gemini 3.1 Flash Lite, and Gemini Nano Banana.
+- Include scoring design, especially the mitigation for semantic-only multimodal embeddings.
+- Include region-aware embedding scoring details.
+- Include VLM structured judge details.
+- Include beam search details.
+- Include seed policy.
+- Include logging and output format.
+- Include CLI requirements.
+- Include config YAML example.
+- Include expected directory layout.
+- Include testing plan with mocked APIs.
+- Include minimal viable implementation order.
+- Include ablations and future extensions.
+- Make it implementation-ready and detailed enough for a coding agent to start building without reading this conversation.
+
+Both files should be clean, repo-ready Markdown. Use clear headings, concise but complete explanations, and include JSON/YAML/code blocks where useful.

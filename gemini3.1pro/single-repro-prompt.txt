@@ -1,0 +1,20 @@
+I want to build "Vision-Ratchet", an autonomous prompt-to-image autoresearch loop inspired by Andrej Karpathy's "autoresearch" project. Instead of an agent modifying code to improve a loss metric, this agent will modify a text prompt to improve a visual similarity metric against a target image.
+
+Here is the required tech stack:
+- VLM Agent (The Researcher): gemini-3.1-flash-lite
+- Image Generator: gemini nano banana (Gemini 3.1 Flash Image preview)
+- Scorer: gemini-embedding-2 (or text-embedding-004)
+
+The loop should work like a "ratchet":
+1. Read the current `prompt.txt`.
+2. Generate an image using the prompt.
+3. Score the generated image against a `target_image.png`.
+4. Decide: If the score improves, keep the new prompt. If it decreases, revert `prompt.txt` to the last known successful version.
+5. Edit: Send the target image, generated image, and current prompt to the VLM to identify ONE specific visual discrepancy and rewrite the prompt to fix it.
+
+Crucial Technical Requirement: To prevent the multimodal embeddings from only capturing semantic meaning (which causes visual drift), the scoring MUST use a "Patch-Based" approach. The script must resize both images, slice them into a 2x2 grid (4 patches), get embeddings for all patches, and calculate the average cosine similarity of the corresponding pairs.
+
+Based on this, please generate two separate files in strict Markdown format:
+
+1. `program.md`: A self-contained usage guide for a human user. It should introduce how this Karpathy-style image loop works, what artifacts it produces overnight, and how to run it (assuming `main.py` is already built). 
+2. `implementation_guide.md`: A detailed instruction document meant for an AI coding agent to implement the `main.py` harness. It must detail the tech stack, the required file structure (`workspace/`, `history.log`), the exact implementation steps for the patch-based scoring, and the specific strict system prompt the VLM should use during the "Edit" step.
