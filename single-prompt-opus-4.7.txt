@@ -1,0 +1,221 @@
+I want to build an autoresearch loop following Andrej Karpathy's autoresearch
+pattern (https://github.com/karpathy/autoresearch), but applied to a different
+problem: given a reference image, discover a prompting strategy that causes
+an image generator to reproduce it as faithfully as possible.
+
+The methodology: a coding agent edits a single Python file
+(`prompt_strategy.py`), runs a fixed benchmark, reads the score, and iterates.
+Comparability across experiments depends on the harness being unchanging.
+
+Please produce **two markdown files** at the end: `program.md` and
+`IMPLEMENTATION.md`. Their scopes are described at the bottom of this prompt.
+Do NOT generate a README.md — that is a separate artifact. Do NOT write the
+actual harness code; just the two design documents.
+
+## The stack
+
+- VLM (writes the prompt from the image, called inside `prompt_strategy.py`):
+  `gemini-3.1-flash-lite-preview`
+- Image generator (called by the harness): `gemini-3.1-flash-image-preview`
+  (Nano Banana 2). Fixed config: 1024×1024, defaults, no aspect ratio override.
+- Semantic similarity: `gemini-embedding-2-preview` (multimodal, 3072-d, used
+  for both original and regenerated images in the same shared space).
+
+The driver agent that runs the loop is independent of the inner VLM. The
+driver might be Claude Code / Codex / Gemini CLI; the inner VLM is always
+Gemini Flash-Lite. Call this separation out explicitly in both docs.
+
+## Why semantic embedding alone isn't enough — and the local metrics that fix it
+
+Gemini embeddings capture semantic content but not visual fidelity. Two
+photos that both depict "golden retriever on grass" can embed close together
+while looking nothing alike. A driver agent will Goodhart any single metric.
+So three additional locally-computed metrics are required, spanning roughly
+orthogonal axes from the semantic one:
+
+- **Structural:** DINOv3 ViT-B/16
+  (`facebook/dinov3-vitb16-pretrain-lvd1689m` via HuggingFace `transformers`)
+  — self-supervised features capturing pose, layout, appearance.
+- **Perceptual:** LPIPS with AlexNet backbone (`lpips` package) — texture
+  and fine-detail match, trained against human similarity judgments.
+- **Color:** HSV histogram with 8×8×8 bins, chi-square distance — explicit
+  palette match, catches "right object, wrong colors" failures.
+
+All four metrics are computed at canonical **448×448** (multiple of DINOv3
+patch size 16) with PIL `LANCZOS` resize, so framing/resolution differences
+don't pollute the signal.
+
+CPU-only execution must work — no GPU required. Per 20-image experiment,
+local metrics combined add ~10s on CPU; the bottleneck is the ~3–5 minutes
+of Nano Banana 2 generation calls. Original-image features are cached on
+first run.
+
+## The composite metric and anti-Goodhart design
+
+Per (original, regenerated) pair, four similarities each in [0, 1] with
+higher = better:
+
+- `s_gemini` = cosine of Gemini embeddings
+- `s_dino` = cosine of DINOv3 CLS-token features
+- `s_lpips` = 1 − clip(lpips_distance, 0, 1)
+- `s_color` = 1 − clip(chi2_distance / 2.0, 0, 1) where chi-square is
+  `0.5 * sum((p−q)² / (p+q+eps))`
+
+Composite = mean of the four per-metric means across 20 eval images.
+
+**Promotion gate** — a candidate is promoted only if BOTH:
+
+1. **No-regression rule:** each individual metric stays within
+   `epsilon = 0.01` of the leader's per-metric mean.
+2. **Improvement rule:** `composite_candidate > composite_leader`.
+
+If any single dimension drops by more than 0.01, candidate is rejected
+even if composite improved. This defeats the most common failure mode:
+boosting one signal by sacrificing another.
+
+**3-seed re-eval:** promoted candidates re-run the full eval with 3
+different generation seeds (fixed seeds 1, 2, 3 for within-session
+reproducibility). The 3-seed mean must still pass the gate; otherwise
+revert.
+
+**Held-out validation:** 5 val images, `uv run harness.py --val` runs the
+full pipeline without promotion logic. Run every ~10 promoted leaders.
+If composite_eval climbs but composite_val flat/dropping, the strategy is
+overfitting.
+
+**VLM judge — diagnostic only, NOT optimized against:** a 6-axis
+Gemini-Flash-Lite judge (subject identity, composition, lighting, palette,
+style, texture; each 1–5) is logged per pair. Optimizing against it would
+create a feedback loop with the prompting model. Be explicit about this.
+
+## Eval set design
+
+The target images are images **used in slides** (hero photos, illustrations,
+icons, etc.), NOT slides themselves. 20 eval images + 5 held-out val.
+Mixed sources.
+
+Recommended distribution:
+- 4× hero photography (landscape, urban, abstract, atmospheric)
+- 3× conceptual flat-vector illustrations
+- 3× isometric or hand-drawn illustrations
+- 2× product photography on clean background
+- 2× people / portraits (one solo, one group — identity stress test)
+- 2× photographic metaphors (cliché stock-photo style)
+- 2× background textures or patterns
+- 1× UI mockup or data viz (text-rendering stress test)
+- 1× icon or pictogram
+
+Difficulty: ~6 easy, ~10 medium, ~4 hard. Val covers same archetypes
+with different content (eval has flat-vector "growth chart" → val has
+flat-vector "team meeting"). Once locked, neither set is modified.
+
+## Multi-CLI compatibility — agent-agnostic
+
+The driver loop must run on any modern coding agent: Claude Code, OpenAI
+Codex CLI, Gemini CLI, OpenCode, Aider, Cursor. Assume only: read files,
+edit files, run shell commands, use git. No tool-name-specific instructions.
+No slash commands. No MCP servers. No persistent agent memory — `logbook.md`
+is the memory.
+
+Per-agent context-file setup table:
+
+| Agent | Auto-loaded file | Setup |
+|---|---|---|
+| Claude Code | CLAUDE.md | `ln -s program.md CLAUDE.md` |
+| Codex CLI | AGENTS.md | `ln -s program.md AGENTS.md` |
+| Gemini CLI | GEMINI.md | `ln -s program.md GEMINI.md` |
+| OpenCode | AGENTS.md | `ln -s program.md AGENTS.md` |
+| Aider | none | `--read program.md` on launch |
+| Cursor | .cursorrules | `ln -s program.md .cursorrules` |
+
+Logbook entries record a `driver:` field for cross-agent comparisons.
+Sandbox/permission needs: network egress to `generativelanguage.googleapis.com`
+and `huggingface.co` (DINOv3 download, first run only); read/write in working
+dir; permission to run `git` and `uv`.
+
+## The two MD files
+
+### File 1: `program.md` — driver-only operating manual
+
+Self-contained. Assumes the harness already exists. The driver only edits
+`prompt_strategy.py` and reads scores; it does NOT modify
+`harness.py` / `embed_and_score.py` / `eval_images/` / `val_images/`.
+
+Sections to include:
+- Brief intro stating the harness is already built; driver does not modify it
+- The setup (model table, driver vs inner-VLM separation note)
+- Repo layout (what's there, with comments on what driver edits / doesn't touch)
+- The single file you edit (signature of `image_to_prompt(image: PIL.Image) -> str`)
+- Running experiments (CLI flags: `--name`, `--val`, `--seeds N`)
+- The metric (full spec — per-pair similarities, composite, promotion gate, 3-seed re-eval, held-out val, VLM-judge as diagnostic only)
+- Workflow per experiment (8 steps, with **"re-read logbook.md before forming a new hypothesis" pulled out as step 1** — this is the single most important instruction)
+- Budget guardrails (per-experiment, per-session caps; 50-experiment session limit)
+- What's worth exploring (output format, decomposition, iterative refinement, prompt length, negative prompts, few-shot, thinking levels, style-vs-content tradeoff via per-metric inspection)
+- What NOT to do (don't modify harness, don't change models, don't memorize eval set, don't optimize against VLM-judge, don't chase lucky runs)
+- Logbook entry format (with `driver:` field)
+- Stopping (session summary: top 3 by composite with val, what worked, what looked promising but failed gate or val, three concrete next experiments)
+- Multi-CLI compatibility (per-agent setup table, sandboxing, session entrypoint kickoff prompt, optional cross-agent meta-experiment with per-driver git branches)
+
+No build instructions anywhere. Driver-only.
+
+### File 2: `IMPLEMENTATION.md` — one-time bootstrap doc for the implementation agent
+
+Opens by stating: this is a one-time job, you are NOT running experiments,
+that's a separate agent's job. References `program.md` as the authoritative
+spec for shared definitions; only adds what's specific to building.
+
+Sections to include:
+- What you're building (one paragraph)
+- Stack (model table)
+- Why these specific local metrics (DINOv3 + LPIPS + HSV justifications, including the orthogonal-axes argument)
+- Local-metric compute requirements (per-image latency on CPU; dominated by API generation, not local compute; cache strategy)
+- Repo layout to create (full file/dir list)
+- Numbered build sequence: `uv init` → `pyproject.toml` → `uv sync` → `.gitignore` → `.env.example` → implement `embed_and_score.py` → implement `harness.py` → ship baseline `prompt_strategy.py` → set up image dirs → symlink `program.md` to `AGENTS.md` → run smoke tests → initial git commit → handoff
+- `pyproject.toml` content (Python 3.11+, deps: `google-genai`, `torch`, `transformers`, `lpips`, `pillow`, `numpy`, `scipy`, `python-dotenv`)
+- `embed_and_score.py` implementation contract:
+  - Module-level setup: dotenv load, Gemini client, DINOv3 model + processor with `cache_dir="weights/"`, LPIPS model, device detection (CPU fallback must work)
+  - Canonical 448×448 LANCZOS preprocessing applied everywhere
+  - Public functions with full signatures and return shapes:
+    - `featurize(image)` returning `{"gemini": (3072,), "dino": (768,), "lpips_tensor": (1,3,448,448), "color_hist": (512,)}`
+    - `similarity(feat_a, feat_b)` returning the four `s_*` floats per the formulas above
+    - `compose(per_image_sims)` returning `{"means": {...}, "composite": float}`
+    - `gate(candidate_means, leader_means, epsilon=0.01)` returning `(passed, reason)`
+    - `vlm_judge(image_a, image_b)` returning `{subject, composition, lighting, palette, style, texture}` each 1–5; diagnostic only
+  - Cache layout: `cache/originals.npz` keyed by path + sha256, with hash-based invalidation
+  - Retry-with-backoff helper for all Gemini API calls (exponential, max 5 retries, jitter)
+- `harness.py` implementation contract:
+  - CLI: `--name`, `--val`, `--seeds N`, `--no-judge`
+  - Per-image flow: call `image_to_prompt`, generate via Nano Banana 2 (1024×1024), save artifacts to `runs/<name>/`, featurize regen, compute similarity, call judge unless `--no-judge`
+  - Print per-metric breakdown table (per-image rows + summary)
+  - Promotion logic: read previous leader from `runs/leader/composite.json`, call `gate`, if passes AND composite improves → run 3-seed re-eval automatically → if still passes, copy artifacts to `runs/leader/` and update `composite.json`
+  - Append logbook entry with `<TODO>` placeholders for hypothesis/takeaway, OR fill from env vars `AUTORESEARCH_HYPOTHESIS` / `AUTORESEARCH_DRIVER` if set
+  - Output discipline: greppable lines `composite=...`, `gate=...`, `promoted=...`
+- Baseline `prompt_strategy.py` — verbatim code to ship: single VLM call with `"Describe this image so it can be regenerated."` as the only instruction. Deliberately mediocre.
+- Eval/val image guidance (the 20+5 slide-image distribution above), and the explicit instruction: **if `eval_images/` is empty, stop and ask the human — do NOT scrape, generate, or auto-fill substitutes**. Provide a sample handoff message for that case. Validation checks once populated: PIL load, ≥512×512, no transparency, no sha256 duplicates between sets, exact counts (20 and 5).
+- Two-stage smoke test:
+  - Test 1: `featurize` on a blank 448×448 red image → expect the four expected keys
+  - Test 2 (if eval_images populated): full harness with `--no-judge` → must complete and self-promote as first leader
+- Definition of done (checklist of ~9 items)
+- Handoff message format (what was built, smoke test status, next action for human, any deviations)
+- Notes for the implementation agent: don't run experiments, don't modify `program.md`, don't over-engineer (~500 lines target across both files), don't assume CUDA
+
+## Specific design decisions to preserve in both docs
+
+- Driver agent ≠ inner VLM. State this explicitly.
+- 448×448 canonical resolution everywhere (DINOv3 patch-size compat).
+- `epsilon = 0.01` for the no-regression gate.
+- 3-seed re-eval with fixed seeds 1, 2, 3.
+- VLM-judge is logged but never optimized — explain why (feedback loop).
+- Step 1 of the workflow is "re-read `logbook.md`" — surface as the single most important instruction.
+- Prefer qualitatively different experiments over local optimization; call out the drift-into-one-direction failure mode.
+- `IMPLEMENTATION.md` should reference `program.md` for shared definitions rather than duplicating them; cost of duplication > cost of cross-reference.
+
+## Style
+
+Tone: direct, technical, well-structured. Use tables for lookup-style content
+(model table, per-agent setup, metric definitions). Use code blocks for shell
+commands and Python signatures. Keep prose tight — these are working docs,
+not marketing.
+
+Output the two files as separate artifacts. Don't summarize them in chat;
+the files are the deliverable.
