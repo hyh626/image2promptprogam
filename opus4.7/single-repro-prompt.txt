@@ -18,7 +18,7 @@ actual harness code; just the two design documents.
   `gemini-3.1-flash-lite-preview`
 - Image generator (called by the harness): `gemini-3.1-flash-image-preview`
   (Nano Banana 2). Fixed config: 1024×1024, defaults, no aspect ratio override.
-- Semantic similarity: `gemini-embedding-2-preview` (multimodal, 3072-d, used
+- Semantic similarity: `gemini-embedding-2` (multimodal, 3072-d, used
   for both original and regenerated images in the same shared space).
 
 The driver agent that runs the loop is independent of the inner VLM. The

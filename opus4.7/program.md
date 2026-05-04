@@ -29,7 +29,7 @@ The methodology follows Andrej Karpathy's
 |---|---|---|
 | **VLM** (called from `prompt_strategy.py`) | `gemini-3.1-flash-lite-preview` (Gemini API) | Looks at the input image and produces a prompt |
 | **Image generator** (called by harness) | `gemini-3.1-flash-image-preview` / Nano Banana 2 (Gemini API) | Generates an image from the prompt |
-| **Semantic similarity** (harness) | `gemini-embedding-2-preview` (Gemini API) | Multimodal embedding — semantic content match |
+| **Semantic similarity** (harness) | `gemini-embedding-2` (Gemini API) | Multimodal embedding — semantic content match |
 | **Structural similarity** (harness) | DINOv2 ViT-B/14 (local, Apache 2.0) | Self-supervised vision features — pose, layout, appearance |
 | **Perceptual similarity** (harness) | LPIPS with AlexNet backbone (local) | Perceptual texture / fine-detail match |
 | **Color similarity** (harness) | HSV histogram, chi-square distance (local) | Color palette match |
@@ -45,7 +45,7 @@ Don't confuse the two roles.
 prompt_strategy.py    ← the ONLY file you edit
 harness.py            ← runs the eval loop. DO NOT MODIFY.
 embed_and_score.py    ← four similarity metrics + compositing. DO NOT MODIFY.
-eval_data/images/eval/ ← 20 fixed reference images. DO NOT MODIFY.
+eval_data/images/eval/ ← 30 fixed reference images. DO NOT MODIFY.
 eval_data/images/val/  ← 5 held-out images. DO NOT MODIFY.
 cache/                ← cached features for original images
 runs/                 ← per-experiment artifacts
@@ -75,7 +75,7 @@ multiple API calls internally.
 uv run harness.py --name <short_descriptive_name>
 ```
 
-For each of the 20 images in `eval_data/images/eval/`, the harness:
+For each of the 30 images in `eval_data/images/eval/`, the harness:
 
 1. Calls `image_to_prompt(image)` to get a prompt.
 2. Calls Nano Banana 2 with that prompt for each configured generation
@@ -104,7 +104,7 @@ uv run harness.py --name <n> --seeds N   # run N seeds per image, N >= 3
 
 | Signal | Computation |
 |---|---|
-| `s_gemini` | cosine of `gemini-embedding-2-preview` vectors |
+| `s_gemini` | cosine of `gemini-embedding-2` vectors |
 | `s_dino` | cosine of DINOv2 ViT-B/14 CLS-token features |
 | `s_lpips` | `1 - clip(lpips_distance, 0, 1)` (LPIPS, AlexNet backbone) |
 | `s_color` | `1 - clip(chi_square / 2.0, 0, 1)` (HSV histogram, 8×8×8 bins) |
@@ -114,11 +114,11 @@ differences don't pollute the signal.
 
 ### Composite
 
-For each of the 20 eval images, compute all four similarities for each
+For each of the 30 eval images, compute all four similarities for each
 configured seed, average per image, then aggregate:
 
 ```
-mean_signal[m]  =  mean over 20 eval images of  s_m
+mean_signal[m]  =  mean over 30 eval images of  s_m
 composite       =  mean across the four metrics
 ```
 
@@ -194,8 +194,8 @@ prompts). Diversity is a goal, not a side effect.
 
 ## Budget guardrails
 
-- **Per experiment:** 20 input images × your VLM calls per image, plus
-  20 generations and 80 local feature extractions. If your strategy
+- **Per experiment:** 30 input images × your VLM calls per image, plus
+  30 generations and 120 local feature extractions. If your strategy
   needs more than ~5 VLM calls per image, the gain has to be
   substantial to justify it.
 - **Per session:** stop after 50 experiments and write a session

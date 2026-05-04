@@ -81,7 +81,7 @@ The standalone experiment folder contains:
 - `eval_data/images/manifest.json`
 
 The bucket uses `train`, `eval`, and `holdout` split names. The prepared task
-uses the canonical storage schema names: bucket `train` becomes the 20-image
+uses the canonical storage schema names: bucket `train` becomes the 30-image
 evaluation split at `eval_data/images/eval`, and bucket `eval` becomes the
 5-image validation split at `eval_data/images/val`. The schema's `train/` and
 `holdout/` directories may stay empty for this harness.

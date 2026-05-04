@@ -42,7 +42,7 @@ HARNESS_VARIANT = "opus4.7"
 METRIC_KEYS = ("s_gemini", "s_dino", "s_lpips", "s_color")
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 SPLITS = ("train", "eval", "val", "holdout")
-EXPECTED_COUNTS = {"eval": 20, "val": 5}
+EXPECTED_COUNTS = {"eval": 30, "val": 5}
 REGRESSION_EPSILON = 0.01
 
 GENERATOR_MODEL = "gemini-3.1-flash-image-preview"
@@ -209,10 +209,10 @@ def validate_inputs(split: str) -> list[TargetImage]:
     val_entries = manifest["splits"]["val"]
     if not eval_entries:
         errors.append(
-            "eval_data/images/eval/ is empty; populate it with 20 reference images before running the harness"
+            "eval_data/images/eval/ is empty; populate it with 30 reference images before running the harness"
         )
     if eval_entries and len(eval_entries) != EXPECTED_COUNTS["eval"]:
-        errors.append(f"eval_data/images/eval/ must contain exactly 20 images, found {len(eval_entries)}")
+        errors.append(f"eval_data/images/eval/ must contain exactly 30 images, found {len(eval_entries)}")
     if val_entries and len(val_entries) != EXPECTED_COUNTS["val"]:
         errors.append(f"eval_data/images/val/ must contain exactly 5 images, found {len(val_entries)}")
     if eval_entries and not val_entries:

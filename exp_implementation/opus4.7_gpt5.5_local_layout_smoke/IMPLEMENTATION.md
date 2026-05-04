@@ -490,7 +490,7 @@ should be straightforward for the driver.
 
 ## 9. Eval and validation images
 
-The eval set is **20 images**, the val set is **5 images**. Once
+The eval set is **30 images**, the val set is **5 images**. Once
 locked, neither is modified — every experiment is comparable only
 because the benchmark is fixed.
 
@@ -530,7 +530,7 @@ experiment afterward.
 A reasonable hand-off message at that point:
 
 > The harness is built and the smoke test for `embed_and_score.py`
-> passes. I need you to populate `eval_data/images/eval/` with 20 reference
+> passes. I need you to populate `eval_data/images/eval/` with 30 reference
 > images and `eval_data/images/val/` with 5 held-out images before I can run
 > the end-to-end smoke test. See IMPLEMENTATION.md section 9 for
 > the recommended distribution. Once images are in place, I'll
@@ -543,7 +543,7 @@ A reasonable hand-off message at that point:
 - No transparent backgrounds (will confuse generation).
 - No duplicate sha256s between `eval_data/images/eval/` and
   `eval_data/images/val/`.
-- File count is exactly 20 and 5.
+- File count is exactly 30 and 5.
 
 If any check fails, stop and report.
 
