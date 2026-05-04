@@ -11,6 +11,8 @@ Usage:
 Copies one spec subfolder into a standalone target folder and downloads the
 visible train/eval image data from GCS. The holdout split is intentionally
 not copied. The source subfolder's single-repro-prompt.txt is also excluded.
+After copying the canonical data/train and data/eval splits, the script creates
+plain-copy compatibility paths for specs that use older names.
 
 Arguments:
   source-subfolder   Repo subfolder to copy, e.g. opus4.7, gpt5.5, gemini3.1pro
@@ -23,7 +25,7 @@ Options:
   -h, --help         Show this help
 
 Environment:
-  DATA_URI           GCS data root. Default: gs://image2promptdata/data
+  DATA_URI           GCS or local data root. Default: gs://image2promptdata/data
 
 Examples:
   ./prepare_agent_task.sh opus4.7 /tmp/agent-harness-opus
@@ -50,6 +52,11 @@ copy_gcs_dir() {
 
   mkdir -p "$dest"
 
+  if [[ -d "$remote" ]]; then
+    copy_dir_contents "$remote" "$dest"
+    return 0
+  fi
+
   if have_cmd gcloud; then
     gcloud storage rsync --recursive "$remote" "$dest"
   elif have_cmd gsutil; then
@@ -57,6 +64,20 @@ copy_gcs_dir() {
   else
     die "install gcloud or gsutil to copy data from GCS, or rerun with --skip-data"
   fi
+}
+
+copy_dir_contents() {
+  local source="$1"
+  local dest="$2"
+
+  (
+    shopt -s dotglob nullglob
+
+    local item
+    for item in "$source"/*; do
+      cp -R "$item" "$dest"/
+    done
+  )
 }
 
 copy_source_dir() {
@@ -98,6 +119,45 @@ copy_dir_if_missing() {
   fi
 
   cp -R "$source_path" "$dest_path"
+}
+
+docs_mention() {
+  local pattern="$1"
+
+  grep -Eq "$pattern" "$TARGET_DIR/program.md" "$TARGET_DIR/IMPLEMENTATION.md" 2>/dev/null
+}
+
+first_image_in_dir() {
+  local source="$1"
+  local image
+
+  while IFS= read -r image; do
+    printf '%s\n' "$image"
+    return 0
+  done < <(
+    find "$source" -type f \( \
+      -iname '*.png' -o \
+      -iname '*.jpg' -o \
+      -iname '*.jpeg' -o \
+      -iname '*.webp' \
+    \) -print | sort
+  )
+}
+
+create_single_target_files() {
+  local first_image
+
+  first_image="$(first_image_in_dir "$DATA_ROOT/train")"
+
+  if [[ -n "$first_image" ]]; then
+    copy_file_if_missing "$first_image" "$TARGET_DIR/target_image.png"
+  else
+    info "No train image found for target_image.png compatibility copy"
+  fi
+
+  if [[ ! -e "$TARGET_DIR/prompt.txt" && ! -L "$TARGET_DIR/prompt.txt" ]]; then
+    printf '%s\n' "A faithful, detailed reproduction of the target image." > "$TARGET_DIR/prompt.txt"
+  fi
 }
 
 SOURCE_ARG=""
@@ -205,12 +265,38 @@ This folder was prepared from:
 - eval: ${DATA_URI%/}/eval
 
 The holdout split is intentionally not copied into this task folder.
+
+Canonical visible splits:
+
+- data/train
+- data/eval
+
+Compatibility copies may also exist, depending on the selected spec:
+
+- eval_images/ from data/train
+- val_images/ from data/eval
+- data/targets/train from data/train
+- data/targets/eval from data/eval
+- target_image.png from the first image found in data/train
+- prompt.txt starter prompt for single-target specs
 EOF
 
-  if grep -Eq "eval_images/|val_images/" "$TARGET_DIR/program.md" "$TARGET_DIR/IMPLEMENTATION.md" 2>/dev/null; then
+  if docs_mention "eval_images/|val_images/"; then
     info "Creating opus-style image directory copies"
     copy_dir_if_missing "$DATA_ROOT/train" "$TARGET_DIR/eval_images"
     copy_dir_if_missing "$DATA_ROOT/eval" "$TARGET_DIR/val_images"
+  fi
+
+  if docs_mention "data/targets"; then
+    info "Creating data/targets split directory copies"
+    mkdir -p "$DATA_ROOT/targets"
+    copy_dir_if_missing "$DATA_ROOT/train" "$DATA_ROOT/targets/train"
+    copy_dir_if_missing "$DATA_ROOT/eval" "$DATA_ROOT/targets/eval"
+  fi
+
+  if docs_mention "target_image\\.png"; then
+    info "Creating single-target compatibility files"
+    create_single_target_files
   fi
 else
   info "Skipping GCS data copy"

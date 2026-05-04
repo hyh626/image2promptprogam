@@ -1,1 +1,125 @@
-Implementation Guide: Vision-Ratchet Harness1. Context and ObjectiveYou are an AI coding agent tasked with building main.py, the core evaluation harness for the Vision-Ratchet system.Vision-Ratchet is an autonomous prompt-engineering system that iteratively discovers the text prompt needed to perfectly reproduce a target image. You will build the harness that orchestrates a Vision-Language Model (VLM), an Image Generator, and a Multimodal Embedding Model through a strict "keep-or-revert" validation loop.Reference: See program.md for a high-level overview of how end-users will utilize this harness.2. Tech Stack & APIsYou will implement this using the Google GenAI SDK. Ensure your code integrates the following specific models:The Researcher (VLM): gemini-3.1-flash-lite. Used for hypothesizing prompt edits based on visual diffs. Ultra-low latency is required for the loop.The Generator: nano-banana-2 (Use the official alias for Gemini 3.1 Flash Image preview). Used to generate the new image from the proposed text prompt.The Scorer: gemini-embedding-2 (or the latest native multimodal embedding model text-embedding-004). Used to embed raw pixels for similarity calculation.3. Directory & File StructureYour main.py script must manage the following file topology:main.py: The core execution loop (which you are writing).prompt.txt: The current best text prompt. The script reads this, passes it to the VLM to edit, and overwrites it.target_image.png: The baseline image the system is trying to replicate.workspace/: A directory created by your script to save generated images (e.g., workspace/gen_001.png).history.log: A CSV tracking Iteration, Cosine_Score, Prompt, and Action (Kept/Reverted).4. The Core Metric: Patch-Based Embedding (CRITICAL)Problem: Multimodal embeddings only capture semantic meaning (e.g., "a cat on a rug"). They do not capture spatial accuracy. If we embed the whole image, the system will suffer from "semantic drift" and accept visually inaccurate generations.Solution: You MUST implement Patch-Based Scoring in main.py to enforce spatial and structural truth.Implementation Steps for Scoring:Load target_image.png and the newly generated current_gen_image.Resize both images to a standard square (e.g., 512x512) using PIL.Slice both images into a 2x2 grid (yielding 4 patches per image: Top-Left, Top-Right, Bottom-Left, Bottom-Right).Call the Gemini Embedding API on all 8 image patches. Ensure you specify a retrieval task type (e.g., RETRIEVAL_DOCUMENT vs RETRIEVAL_QUERY) if required by the API.Calculate the Cosine Similarity for each corresponding spatial pair (e.g., Target-Top-Left vs. Gen-Top-Left).The final Similarity_Score is the average of these 4 cosine similarity values.5. The Execution Loop (The Ratchet)Implement a robust while or for loop in main.py driven by an --iterations command-line argument.Step A: GenerateRead the contents of prompt.txt.Call the image generation API with the text prompt.Save the resulting image to workspace/gen_{iteration}.png.Step B: ScoreCalculate the Similarity_Score using the Patch-Based Embedding method defined in Section 4.Step C: Decide (The "Git Reset" Logic)First Iteration: Set best_score = Similarity_Score and cache the current prompt.If Similarity_Score > best_score:Accept the new prompt. Update best_score.Log "Kept" to history.log.If Similarity_Score <= best_score:Reject the new prompt.Revert: Overwrite prompt.txt with the last known successful prompt.Log "Reverted" to history.log.Step D: Hypothesize & EditPass the target_image.png, the last accepted generated image, and the last accepted text prompt to gemini-3.1-flash-lite.You MUST use this specific System Instruction for the VLM:"You are an expert prompt engineer. Your goal is to make the generated image visually identical to the target image.DO NOT try to make the image 'beautiful' or 'high quality' if the target is blurry, low-res, or has artifacts; you must reproduce the flaws.The current similarity score is {best_score}.Look at the differences between the target and the generation. Identify ONE specific spatial, textural, or lighting element that is incorrect.Rewrite the text prompt to fix this specific element. Output ONLY the raw text of the new prompt, with no markdown or conversational filler."Write the VLM's output directly into prompt.txt.6. Development RequirementsEnsure graceful error handling (e.g., API rate limits, timeouts, image safety blocks).Add a command-line argument parser (argparse) for --iterations (default 50) and --target (default target_image.png).Ensure the script halts and warns the user if the target image is missing from the directory before starting the loop.
+# Implementation Guide: Vision-Ratchet Harness
+
+You are an AI coding agent tasked with building `main.py`, the core
+evaluation harness for the Vision-Ratchet system.
+
+Vision-Ratchet is an autonomous prompt-engineering system that iteratively
+discovers the text prompt needed to reproduce a target image. The harness
+orchestrates a Vision-Language Model, an image generator, and visual
+similarity metrics through a strict keep-or-revert loop.
+
+See `program.md` for the user-facing workflow.
+
+## 1. Tech Stack And APIs
+
+Use the Google GenAI SDK against Vertex AI for all Gemini model calls:
+
+```python
+client = genai.Client(
+    vertexai=True,
+    project=os.environ["GOOGLE_CLOUD_PROJECT"],
+    location=os.environ.get("GOOGLE_CLOUD_LOCATION", "global"),
+)
+```
+
+Default Gemini settings:
+
+| Role | Model | Notes |
+|---|---|---|
+| Researcher / VLM | `gemini-3.1-flash-lite-preview` | Hypothesizes prompt edits from visual differences. |
+| Image generator | `gemini-3.1-flash-image-preview` | Generates images from candidate prompts. Supports an `aspect_ratio` parameter. |
+| Embedding scorer | `gemini-embedding-2` | Embeds target/generated images or crops for similarity scoring. |
+
+Also use DINOv2 ViT-B/14 (`facebook/dinov2-base`) locally as a structural
+similarity metric. DINOv2 should complement Gemini embeddings by catching pose,
+layout, and appearance differences that semantic embeddings can miss.
+
+## 2. Directory And File Structure
+
+Your script must manage this topology:
+
+```text
+main.py             # Core execution loop
+prompt.txt          # Current best prompt
+target_image.png    # Target image to reproduce
+workspace/          # Generated images, e.g. workspace/gen_001.png
+history.log         # CSV log of iteration, score, prompt, and action
+```
+
+## 3. Generation
+
+Read `prompt.txt`, call `gemini-3.1-flash-image-preview`, and save the
+returned image to `workspace/gen_<iteration>.png`.
+
+Do not force every generation to square. Inspect the target image dimensions,
+choose the nearest supported aspect ratio, and pass it through the Gemini image
+generation model's `aspect_ratio` parameter. For example, use `1:1` for square
+targets, `4:3` or `16:9` for landscape targets, and `3:4` or `9:16` for
+portrait targets.
+
+## 4. Core Metric: Patch-Based Similarity
+
+Whole-image multimodal embeddings can over-reward broad semantic similarity.
+Implement patch-based scoring:
+
+1. Load `target_image.png` and the newly generated image.
+2. Resize both to a common square for scoring, e.g. 512x512.
+3. Slice both into a 2x2 grid.
+4. Embed each corresponding crop with `gemini-embedding-2`.
+5. Compute cosine similarity for each corresponding crop pair.
+6. Average the four crop similarities.
+
+Add a DINOv2 structural similarity score:
+
+1. Extract DINOv2 features for the target and generated image.
+2. L2-normalize the vectors.
+3. Compute cosine similarity.
+
+The primary score can be a weighted composite of patch embedding similarity and
+DINOv2 structural similarity. Keep the weights explicit in code so future
+experiments can adjust them deliberately.
+
+## 5. The Ratchet Loop
+
+Implement a loop driven by `--iterations`:
+
+1. Generate an image from the current `prompt.txt`.
+2. Score it against `target_image.png`.
+3. If the score improves, keep the prompt and update `best_score`.
+4. If the score does not improve, restore `prompt.txt` to the last best prompt.
+5. Log the iteration to `history.log`.
+6. Ask `gemini-3.1-flash-lite-preview` to propose one targeted prompt edit.
+7. Write the VLM output back to `prompt.txt`.
+
+Use this VLM instruction shape:
+
+```text
+You are an expert prompt engineer. Your goal is to make the generated image
+visually identical to the target image.
+Do not make the image beautiful or high quality if the target is blurry,
+low-res, or has artifacts; reproduce the flaws.
+The current similarity score is {best_score}.
+Look at the differences between the target and the generation. Identify one
+specific spatial, textural, color, or lighting element that is incorrect.
+Rewrite the text prompt to fix this specific element. Output only the raw text
+of the new prompt.
+```
+
+## 6. CLI And Error Handling
+
+Add argparse support:
+
+```text
+--iterations  default 50
+--target      default target_image.png
+```
+
+Fail clearly if:
+
+- `target_image.png` is missing,
+- `prompt.txt` is missing,
+- `GOOGLE_CLOUD_PROJECT` or Vertex AI auth is unavailable,
+- a generation request is blocked or returns no image,
+- an embedding/scoring call fails after retries.
+
+Handle API rate limits and transient errors with retry/backoff.
