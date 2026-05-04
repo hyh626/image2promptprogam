@@ -20,11 +20,14 @@ The intended Gemini-oriented setup is:
 
 | Component | Role |
 |---|---|
-| Gemini embeddings | Similarity metric / reward model. |
-| Gemini Flash Lite VLM | Target analyzer, generated-image critic, prompt optimizer, rule extractor. |
-| Gemini Nano Banana image model | Fixed image generator / environment. |
+| Vertex AI Gemini `gemini-embedding-2` | Similarity metric / reward model. |
+| Vertex AI Gemini `gemini-3.1-flash-lite-preview` | Target analyzer, generated-image critic, prompt optimizer, rule extractor. |
+| Vertex AI Gemini `gemini-3.1-flash-image-preview` | Fixed image generator / environment. |
+| DINOv2 ViT-B/14 (`facebook/dinov2-base`) | Local structural similarity signal for pose, layout, and appearance. |
 
 Keep all model names configurable. Do not hardcode Gemini-specific model IDs in core logic.
+The default Gemini provider should use Vertex AI with `location: global` for
+all Gemini model calls.
 
 ## 2. Core Research Question
 
@@ -142,16 +145,25 @@ output_dir: outputs/runs
 models:
   embedding:
     provider: gemini
-    model: gemini-embedding-model
+    model: gemini-embedding-2
+    vertexai: true
+    location: global
   vlm:
     provider: gemini
-    model: gemini-flash-lite
+    model: gemini-3.1-flash-lite-preview
+    vertexai: true
+    location: global
   generator:
     provider: gemini
-    model: gemini-nano-banana
+    model: gemini-3.1-flash-image-preview
+    vertexai: true
+    location: global
+  structural:
+    provider: local
+    model: facebook/dinov2-base
 
 generation:
-  aspect_ratio: "1:1"
+  aspect_ratio: auto
   resolution: null
   num_images_per_prompt: 1
   seed_policy: random
@@ -170,9 +182,10 @@ search:
 scoring:
   mode: composite
   weights:
-    whole_image_embedding: 0.45
+    whole_image_embedding: 0.35
     region_embedding: 0.25
-    vlm_judge: 0.30
+    dino_structure: 0.20
+    vlm_judge: 0.20
   region_embedding:
     enabled: true
     crops:
@@ -194,6 +207,21 @@ cost:
 ```
 
 Implementation should validate config early and fail with clear errors.
+When `generation.aspect_ratio` is `auto`, infer it from the target image and
+pass the nearest supported aspect ratio to
+`gemini-3.1-flash-image-preview` through its `aspect_ratio` parameter. Do not
+silently force all targets to `1:1`.
+
+For Vertex AI Gemini clients, read `GOOGLE_CLOUD_PROJECT` from the environment
+and default location to `global`:
+
+```python
+client = genai.Client(
+  vertexai=True,
+  project=os.environ["GOOGLE_CLOUD_PROJECT"],
+  location=os.environ.get("GOOGLE_CLOUD_LOCATION", "global"),
+)
+```
 
 ## 7. Provider Interfaces
 
@@ -272,6 +300,8 @@ class VLMClient:
 Responsibilities:
 
 - generate one or more images from prompt text,
+- preserve target framing by passing the configured or inferred
+  `aspect_ratio` parameter when the Gemini image model is used,
 - save returned images,
 - return generation metadata.
 
@@ -522,7 +552,15 @@ Compute embedding similarity for each corresponding crop and average.
 
 This mitigates the weakness that whole-image embeddings often ignore layout.
 
-### 13.3 VLM Structured Judge
+### 13.3 DINOv2 Structural Similarity
+
+Use DINOv2 ViT-B/14 (`facebook/dinov2-base`) locally as a structural
+similarity signal. Extract normalized image features for the target and
+generated image, compute cosine similarity, and log it as
+`dino_structure`. This signal should complement Gemini embeddings by catching
+pose, layout, and appearance mismatches.
+
+### 13.4 VLM Structured Judge
 
 Ask the VLM to compare target and generated image and output structured scores.
 
@@ -546,20 +584,21 @@ Expected schema:
 
 Normalize numeric fields to 0–1 and average them for `vlm_judge_score`.
 
-### 13.4 Composite Score
+### 13.5 Composite Score
 
 Default:
 
 ```text
 final_score =
-  0.45 * whole_image_embedding
+  0.35 * whole_image_embedding
 + 0.25 * region_embedding
-+ 0.30 * vlm_judge
++ 0.20 * dino_structure
++ 0.20 * vlm_judge
 ```
 
 Weights should be configurable.
 
-### 13.5 Optional Diagnostics
+### 13.6 Optional Diagnostics
 
 Implement as logging-only first, then allow inclusion in score later.
 

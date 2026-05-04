@@ -37,15 +37,37 @@ being unchanging.
 
 | Role | Model / Method | Notes |
 |---|---|---|
-| **VLM** | `gemini-3.1-flash-lite-preview` (Gemini API) | Called from `prompt_strategy.py`. Driver agent will iterate on this. |
-| **Image generator** | `gemini-3.1-flash-image-preview` / Nano Banana 2 (Gemini API) | Called from `harness.py`. Fixed config: 1024×1024, defaults. |
-| **Semantic similarity** | `gemini-embedding-2-preview` (Gemini API) | Multimodal: embeds images and text into shared 3072-d space. |
+| **VLM** | `gemini-3.1-flash-lite-preview` (Vertex AI Gemini, `location=global`) | Called from `prompt_strategy.py`. Driver agent will iterate on this. |
+| **Image generator** | `gemini-3.1-flash-image-preview` / Nano Banana 2 (Vertex AI Gemini, `location=global`) | Called from `harness.py`. Pass an aspect ratio that matches the reference image. |
+| **Semantic similarity** | `gemini-embedding-2` (Vertex AI Gemini, `location=global`) | Multimodal: embeds images and text into shared vector space. |
 | **Structural similarity** | DINOv2 ViT-B/14 (`facebook/dinov2-base`, local via `transformers`, Apache 2.0) | Self-supervised vision features. ~330 MB. |
 | **Perceptual similarity** | LPIPS, AlexNet backbone (`lpips` package, local) | ~25 MB. |
 | **Color similarity** | HSV histogram, chi-square distance (computed locally) | No model needed. |
 
 Python 3.11+, dependencies managed by `uv`. CPU-only execution must
 work; GPU is used automatically if present.
+
+### Gemini access
+
+Use Vertex AI for all Gemini calls, not API-key-only Gemini Developer
+API mode. Instantiate the Google GenAI SDK with Vertex AI enabled,
+project from `GOOGLE_CLOUD_PROJECT`, and location `global`:
+
+```python
+_client = genai.Client(
+    vertexai=True,
+    project=os.environ["GOOGLE_CLOUD_PROJECT"],
+    location=os.environ.get("GOOGLE_CLOUD_LOCATION", "global"),
+)
+```
+
+`.env.example` should include:
+
+```text
+GOOGLE_GENAI_USE_VERTEXAI=true
+GOOGLE_CLOUD_PROJECT=
+GOOGLE_CLOUD_LOCATION=global
+```
 
 ### Why these specific local metrics
 
@@ -116,7 +138,8 @@ Do this top to bottom. Don't skip the smoke test in step 9.
    `pyproject.toml` with the one in section 5, run `uv sync`.
 2. **Create `.gitignore`.** Must exclude: `.env`, `weights/`,
    `cache/`, `runs/`, `__pycache__/`, `*.pyc`, `.venv/`.
-3. **Create `.env.example`** with `GEMINI_API_KEY=` (no value).
+3. **Create `.env.example`** with `GOOGLE_GENAI_USE_VERTEXAI=true`,
+   `GOOGLE_CLOUD_PROJECT=`, and `GOOGLE_CLOUD_LOCATION=global`.
 4. **Implement `embed_and_score.py`** per section 6.
 5. **Implement `harness.py`** per section 7.
 6. **Ship the baseline `prompt_strategy.py`** per section 8.
@@ -155,9 +178,11 @@ unless required — let `uv` resolve a compatible one.
 
 ### Module-level setup
 
-- Load `dotenv` and read `GEMINI_API_KEY`. Fail fast with a clear
-  error if missing.
-- Instantiate the Gemini client once.
+- Load `dotenv`, read `GOOGLE_CLOUD_PROJECT`, and default
+  `GOOGLE_CLOUD_LOCATION` to `global`. Fail fast with a clear error if
+  the project is missing.
+- Instantiate the Gemini client once in Vertex AI mode:
+  `genai.Client(vertexai=True, project=..., location="global")`.
 - Load DINOv2 ViT-B/14:
   ```python
   from transformers import AutoModel, AutoImageProcessor
@@ -306,8 +331,12 @@ For each image in the target set:
 2. Call `prompt_strategy.image_to_prompt(image)`. Time it.
 3. Call Nano Banana 2 with the prompt:
    - Model: `gemini-3.1-flash-image-preview`
-   - Image config: 1024×1024, default settings
-   - No aspect ratio override
+   - Use Vertex AI with `location=global`
+   - Derive an aspect ratio from the reference image dimensions and
+     pass it through the model's supported `aspect_ratio` parameter
+     (for example `1:1`, `4:3`, `3:4`, `16:9`, or `9:16` as
+     appropriate). Do not force every generation to square unless the
+     reference image is square.
 4. Save regenerated image to `runs/<name>/<image_id>.png` and the
    prompt to `runs/<name>/<image_id>.txt`.
 5. Call `featurize` on the regenerated image. Read cached features
@@ -399,7 +428,11 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-_client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+_client = genai.Client(
+    vertexai=True,
+    project=os.environ["GOOGLE_CLOUD_PROJECT"],
+    location=os.environ.get("GOOGLE_CLOUD_LOCATION", "global"),
+)
 
 def image_to_prompt(image: Image.Image) -> str:
     """Given a reference image, return a prompt for Nano Banana 2."""
@@ -494,7 +527,8 @@ end-to-end.
 
 If this fails, fix before proceeding. Common failure modes:
 
-- `GEMINI_API_KEY` missing → check `.env` and `dotenv` load.
+- `GOOGLE_CLOUD_PROJECT` missing or Vertex AI credentials unavailable →
+  check `.env`, `dotenv` load, and local Google Cloud auth.
 - HuggingFace download fails → check network, retry.
 - Torch CPU fallback path broken → make sure `device` detection
   doesn't crash without CUDA.

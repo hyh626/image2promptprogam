@@ -63,12 +63,17 @@ That creates a standalone folder containing:
 - `data/train`
 - `data/eval`
 
-For specs that refer to `eval_images/` and `val_images/`, the script also
-copies compatibility directories from the visible data:
+The bucket uses `train`, `eval`, and `holdout` split names. Since some spec
+variants use older local names, the script also creates plain-copy
+compatibility paths when a selected spec mentions them:
 
 ```text
 eval_images/  # copied from data/train
 val_images/   # copied from data/eval
+data/targets/train/
+data/targets/eval/
+target_image.png  # copied from the first image found in data/train
+prompt.txt        # starter prompt for single-target specs
 ```
 
 The generated folder is overwritten by default. Use `--no-overwrite` if you
