@@ -85,7 +85,10 @@ class Stats:
 def parse_gcs_uri(uri: str) -> tuple[str, str]:
     if not uri.startswith("gs://"):
         raise ValueError(f"--dst must start with gs://, got {uri!r}")
-    rest = uri[len("gs://"):].strip("/")
+    rest = uri[len("gs://"):]
+    if rest.startswith("/") or not rest:
+        raise ValueError(f"missing bucket in {uri!r}")
+    rest = rest.rstrip("/")
     if "/" in rest:
         bucket, prefix = rest.split("/", 1)
     else:
