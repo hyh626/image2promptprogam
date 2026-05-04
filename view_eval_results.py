@@ -1,0 +1,695 @@
+#!/usr/bin/env python3
+"""Web viewer for image-to-prompt autoresearch experiment results.
+
+Browse a directory tree, see a summary table when entering a folder that
+contains experiment runs (per EVAL_STORAGE_SCHEMA.md), and click a run to
+visualize its per-image targets, generations, prompts, and scores.
+
+Usage:
+    python view_eval_results.py --root <path> [--port 8765] [--host 127.0.0.1]
+    python view_eval_results.py --root . --open
+
+Stdlib-only. Bind to 127.0.0.1 by default.
+"""
+from __future__ import annotations
+
+import argparse
+import http.server
+import json
+import mimetypes
+import socketserver
+import sys
+import threading
+import urllib.parse
+import webbrowser
+from pathlib import Path
+from typing import Any
+
+ROOT: Path = Path()
+
+
+# --------------------------- path safety ---------------------------
+
+
+def resolve_safe(rel: str) -> Path:
+    cleaned = (rel or "").lstrip("/").replace("\\", "/")
+    target = (ROOT / cleaned).resolve() if cleaned else ROOT
+    if target != ROOT and ROOT not in target.parents:
+        raise PermissionError(f"path escapes root: {rel!r}")
+    return target
+
+
+def rel_path(p: Path) -> str:
+    try:
+        rel = p.resolve().relative_to(ROOT)
+    except ValueError:
+        return ""
+    s = str(rel)
+    return "" if s == "." else s
+
+
+# --------------------------- classification ---------------------------
+
+
+def classify_dir(p: Path) -> str:
+    if (p / "run.json").is_file():
+        return "run"
+    if p.is_dir():
+        try:
+            for child in p.iterdir():
+                if child.is_dir() and (child / "run.json").is_file():
+                    return "runs_container"
+        except PermissionError:
+            pass
+    return "dir"
+
+
+def find_manifest(start: Path) -> Path | None:
+    cur = start.resolve()
+    while True:
+        candidate = cur / "eval_data" / "images" / "manifest.json"
+        if candidate.is_file():
+            return candidate
+        if cur == ROOT or cur == cur.parent:
+            return None
+        cur = cur.parent
+
+
+def load_manifest_for(start: Path) -> dict[str, dict[str, Any]]:
+    mp = find_manifest(start)
+    if not mp:
+        return {}
+    try:
+        data = json.loads(mp.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    manifest_dir_rel = rel_path(mp.parent)
+    for split_name, entries in (data.get("splits") or {}).items():
+        for entry in entries or []:
+            if isinstance(entry, dict) and "image_id" in entry:
+                merged = dict(entry)
+                merged["__split__"] = split_name
+                merged["__manifest_dir__"] = manifest_dir_rel
+                out[entry["image_id"]] = merged
+    return out
+
+
+def safe_load_json(path: Path) -> Any:
+    if not path.is_file():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+# --------------------------- view builders ---------------------------
+
+
+def breadcrumb(p: Path) -> list[dict[str, str]]:
+    rel = rel_path(p)
+    parts = [] if not rel else rel.split("/")
+    out = [{"name": ROOT.name or "/", "path": ""}]
+    accum = ""
+    for part in parts:
+        accum = f"{accum}/{part}" if accum else part
+        out.append({"name": part, "path": accum})
+    return out
+
+
+def list_subdirs(p: Path) -> tuple[list[dict], list[dict]]:
+    subdirs: list[dict] = []
+    files: list[dict] = []
+    if not p.is_dir():
+        return subdirs, files
+    try:
+        children = sorted(p.iterdir(), key=lambda c: (not c.is_dir(), c.name.lower()))
+    except PermissionError:
+        return subdirs, files
+    for child in children:
+        if child.name.startswith("."):
+            continue
+        entry = {"name": child.name, "path": rel_path(child)}
+        if child.is_dir():
+            entry["kind"] = classify_dir(child)
+            subdirs.append(entry)
+        else:
+            try:
+                entry["size"] = child.stat().st_size
+            except OSError:
+                entry["size"] = 0
+            files.append(entry)
+    return subdirs, files
+
+
+def build_summary(container: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    try:
+        children = sorted(container.iterdir())
+    except PermissionError:
+        return rows
+    for child in children:
+        if not (child.is_dir() and (child / "run.json").is_file()):
+            continue
+        run = safe_load_json(child / "run.json") or {}
+        agg = safe_load_json(child / "aggregate.json") or {}
+        gate = safe_load_json(child / "gate.json") or {}
+        rows.append({
+            "run_id": child.name,
+            "path": rel_path(child),
+            "driver": run.get("driver"),
+            "name": run.get("name"),
+            "status": run.get("status"),
+            "started_at": run.get("started_at"),
+            "harness_variant": run.get("harness_variant"),
+            "split": run.get("split"),
+            "n_images": agg.get("n_images") or len(run.get("image_ids") or []),
+            "composite": agg.get("composite"),
+            "composite_unweighted": agg.get("composite_unweighted"),
+            "means": agg.get("means") or {},
+            "decision": gate.get("decision"),
+            "single_run_gate": gate.get("single_run_gate"),
+            "three_seed_gate": gate.get("three_seed_gate"),
+        })
+    rows.sort(
+        key=lambda r: (
+            -(r.get("composite") if isinstance(r.get("composite"), (int, float)) else -1),
+            r.get("started_at") or "",
+        )
+    )
+    return rows
+
+
+def build_run_detail(run_dir: Path) -> dict[str, Any]:
+    run = safe_load_json(run_dir / "run.json") or {}
+    agg = safe_load_json(run_dir / "aggregate.json") or {}
+    gate = safe_load_json(run_dir / "gate.json") or {}
+    cfg = safe_load_json(run_dir / "config.json") or {}
+    manifest = load_manifest_for(run_dir)
+
+    images: list[dict[str, Any]] = []
+    for image_id in run.get("image_ids") or []:
+        img_dir = run_dir / "per_image" / image_id
+        scores_doc = safe_load_json(img_dir / "scores.json") or {}
+        prompt_path = img_dir / "prompt.txt"
+        prompt_text = ""
+        if prompt_path.is_file():
+            try:
+                prompt_text = prompt_path.read_text(encoding="utf-8")
+            except Exception:
+                prompt_text = ""
+
+        target_url = None
+        meta = manifest.get(image_id)
+        if meta:
+            split = meta["__split__"]
+            mdir = meta["__manifest_dir__"]
+            filename = meta.get("filename")
+            if filename:
+                target_rel = f"{mdir}/{split}/{filename}" if mdir else f"{split}/{filename}"
+                target_url = "/api/file?path=" + urllib.parse.quote(target_rel)
+
+        gen_path = img_dir / "generated.png"
+        gen_url = None
+        if gen_path.is_file():
+            gen_url = "/api/file?path=" + urllib.parse.quote(rel_path(gen_path))
+
+        seed_entries: list[dict[str, Any]] = []
+        seeds_dir = img_dir / "seeds"
+        if seeds_dir.is_dir():
+            for seed_dir in sorted(seeds_dir.iterdir()):
+                if not seed_dir.is_dir():
+                    continue
+                seed_scores = safe_load_json(seed_dir / "scores.json") or {}
+                seed_gen = seed_dir / "generated.png"
+                seed_url = None
+                if seed_gen.is_file():
+                    seed_url = "/api/file?path=" + urllib.parse.quote(rel_path(seed_gen))
+                seed_entries.append({
+                    "seed": seed_dir.name,
+                    "scores": seed_scores.get("scores") or {},
+                    "generated_url": seed_url,
+                })
+
+        images.append({
+            "image_id": image_id,
+            "scores": scores_doc.get("scores") or {},
+            "judge": scores_doc.get("judge"),
+            "prompt": prompt_text,
+            "target_url": target_url,
+            "generated_url": gen_url,
+            "seeds": seed_entries,
+        })
+
+    return {
+        "run": run,
+        "config": cfg,
+        "aggregate": agg,
+        "gate": gate,
+        "images": images,
+    }
+
+
+def inspect_dir(p: Path) -> dict[str, Any]:
+    kind = classify_dir(p)
+    subdirs, files = list_subdirs(p)
+    result: dict[str, Any] = {
+        "path": rel_path(p),
+        "kind": kind,
+        "breadcrumb": breadcrumb(p),
+        "subdirs": subdirs,
+        "files": files,
+        "root_name": ROOT.name or "/",
+    }
+    if kind == "runs_container":
+        result["summary"] = build_summary(p)
+    elif kind == "run":
+        result["run_detail"] = build_run_detail(p)
+    return result
+
+
+# --------------------------- HTTP handler ---------------------------
+
+
+INDEX_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Eval Results Viewer</title>
+<style>
+  :root {
+    --fg: #1a1a1a; --muted: #666; --bg: #fafafa; --panel: #fff;
+    --border: #e5e5e5; --accent: #2257d6; --good: #1f8f3a; --bad: #c83232;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; color: var(--fg); background: var(--bg); }
+  .layout { display: grid; grid-template-columns: 320px 1fr; height: 100vh; }
+  .sidebar { background: var(--panel); border-right: 1px solid var(--border); overflow-y: auto; padding: 12px; }
+  .main { padding: 18px 22px; overflow-y: auto; }
+  .bc { font-size: 13px; margin-bottom: 14px; word-break: break-all; }
+  .bc a { color: var(--accent); text-decoration: none; }
+  .bc a:hover { text-decoration: underline; }
+  .bc .sep { color: var(--muted); margin: 0 4px; }
+  ul.dirlist { list-style: none; padding: 0; margin: 0; }
+  ul.dirlist li { padding: 5px 6px; border-radius: 4px; display: flex; align-items: center; gap: 6px; }
+  ul.dirlist li:hover { background: #f1f3f7; }
+  ul.dirlist a { color: var(--fg); text-decoration: none; flex: 1; word-break: break-all; }
+  .badge { font-size: 11px; padding: 1px 6px; border-radius: 9px; background: #eef2ff; color: var(--accent); }
+  .badge.run { background: #e8f5ec; color: var(--good); }
+  .badge.exps { background: #fff4e0; color: #b76b00; }
+  .hint { color: var(--muted); font-style: italic; }
+  h2 { margin: 0 0 6px 0; font-size: 18px; }
+  h3 { margin: 22px 0 8px 0; font-size: 15px; }
+  h4 { margin: 0 0 6px 0; font-size: 13px; word-break: break-all; }
+  table { border-collapse: collapse; width: 100%; background: var(--panel); border: 1px solid var(--border); }
+  th, td { padding: 8px 10px; border-bottom: 1px solid var(--border); text-align: left; vertical-align: top; font-size: 13px; }
+  th { background: #f5f6f9; font-weight: 600; position: sticky; top: 0; }
+  tr.row { cursor: pointer; }
+  tr.row:hover { background: #f5f8ff; }
+  td.composite { font-weight: 600; font-variant-numeric: tabular-nums; }
+  td.metric { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; color: #333; }
+  .meta-row { color: var(--muted); font-size: 13px; }
+  .meta-row b { color: var(--fg); }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 14px; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 12px; }
+  .pair { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 6px 0; }
+  figure { margin: 0; text-align: center; }
+  figure img { max-width: 100%; max-height: 220px; border: 1px solid var(--border); border-radius: 4px; background: #f5f5f5; }
+  figure figcaption { font-size: 11px; color: var(--muted); margin-top: 2px; }
+  .scores { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; margin: 6px 0; word-break: break-all; }
+  .scores .pos { color: var(--good); }
+  .scores .neg { color: var(--bad); }
+  details { margin-top: 6px; }
+  summary { cursor: pointer; font-size: 12px; color: var(--muted); }
+  pre { white-space: pre-wrap; background: #f7f7f9; padding: 8px; border-radius: 4px; font-size: 12px; max-height: 200px; overflow: auto; }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 9px; font-size: 11px; }
+  .pill.promoted { background: #e8f5ec; color: var(--good); }
+  .pill.rejected { background: #fdecec; color: var(--bad); }
+  .pill.reverted { background: #fff4e0; color: #b76b00; }
+  .pill.no_leader { background: #eef2ff; color: var(--accent); }
+  .pill.fail { background: #fdecec; color: var(--bad); }
+  .pill.pass { background: #e8f5ec; color: var(--good); }
+  .heading { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+  .heading code { background: #f1f3f7; padding: 1px 5px; border-radius: 3px; font-size: 12px; }
+  .empty { color: var(--muted); padding: 16px 0; }
+</style>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar" id="sidebar"></aside>
+  <main class="main" id="main"></main>
+</div>
+<script>
+const $ = (id) => document.getElementById(id);
+
+function escapeHtml(s) {
+  if (s == null) return '';
+  return String(s).replace(/[&<>"']/g, (ch) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+}
+function fmt(n, d=4) {
+  if (n == null || typeof n !== 'number' || !isFinite(n)) return '—';
+  return n.toFixed(d);
+}
+function pathLink(path, label, extraClass='') {
+  return `<a href="#${encodeURIComponent(path)}" data-path="${escapeHtml(path)}" class="link ${extraClass}">${escapeHtml(label)}</a>`;
+}
+
+async function loadPath(path) {
+  try {
+    const r = await fetch('/api/inspect?path=' + encodeURIComponent(path || ''));
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({error: r.statusText}));
+      $('main').innerHTML = `<p class="empty">Error: ${escapeHtml(err.error || 'unknown')}</p>`;
+      return;
+    }
+    const data = await r.json();
+    render(data);
+    document.title = (data.path || data.root_name) + ' — eval viewer';
+  } catch (e) {
+    $('main').innerHTML = `<p class="empty">Error: ${escapeHtml(e.message)}</p>`;
+  }
+}
+
+function render(d) {
+  $('sidebar').innerHTML = renderSidebar(d);
+  $('main').innerHTML = renderMain(d);
+}
+
+function renderSidebar(d) {
+  let html = '<div class="bc">';
+  d.breadcrumb.forEach((b, i) => {
+    if (i > 0) html += '<span class="sep">/</span>';
+    html += pathLink(b.path, b.name);
+  });
+  html += '</div>';
+  if (!d.subdirs.length) {
+    html += '<p class="hint">(no subdirectories)</p>';
+  } else {
+    html += '<ul class="dirlist">';
+    for (const s of d.subdirs) {
+      const cls = s.kind === 'run' ? 'run' : (s.kind === 'runs_container' ? 'exps' : '');
+      const label = s.kind === 'run' ? 'run' : (s.kind === 'runs_container' ? 'experiments' : '');
+      const badge = label ? `<span class="badge ${cls}">${label}</span>` : '';
+      html += `<li>${pathLink(s.path, s.name)} ${badge}</li>`;
+    }
+    html += '</ul>';
+  }
+  if (d.files && d.files.length) {
+    html += '<h3 style="font-size:12px;color:var(--muted);margin:14px 0 4px;">files</h3><ul class="dirlist">';
+    for (const f of d.files) {
+      html += `<li><span style="color:var(--muted);flex:1;">${escapeHtml(f.name)}</span></li>`;
+    }
+    html += '</ul>';
+  }
+  return html;
+}
+
+function renderMain(d) {
+  if (d.kind === 'run') return renderRun(d.run_detail || {});
+  if (d.kind === 'runs_container') return renderSummary(d);
+  return renderPlainDir(d);
+}
+
+function renderPlainDir(d) {
+  const here = d.path || d.root_name;
+  let html = `<h2>${escapeHtml(here)}</h2>`;
+  html += `<p class="hint">Pick a subdirectory in the sidebar.`;
+  const children = d.subdirs || [];
+  const exps = children.filter(c => c.kind === 'runs_container');
+  const runs = children.filter(c => c.kind === 'run');
+  if (exps.length) {
+    html += ` This folder has <b>${exps.length}</b> experiment folder${exps.length === 1 ? '' : 's'}: `;
+    html += exps.map(s => pathLink(s.path, s.name)).join(', ');
+    html += '.';
+  } else if (runs.length) {
+    html += ` This folder has <b>${runs.length}</b> run folder${runs.length === 1 ? '' : 's'}.`;
+  }
+  html += '</p>';
+  return html;
+}
+
+function decisionPill(d) {
+  if (!d) return '';
+  const cls = d === 'promoted' ? 'promoted' :
+              d === 'rejected' ? 'rejected' :
+              d === 'reverted_after_reeval' ? 'reverted' :
+              d === 'no_leader' ? 'no_leader' : '';
+  const label = d === 'reverted_after_reeval' ? 'reverted' : d;
+  return `<span class="pill ${cls}">${escapeHtml(label)}</span>`;
+}
+
+function gatePill(g) {
+  if (!g) return '';
+  const cls = g === 'pass' ? 'pass' : (g === 'fail' ? 'fail' : '');
+  return `<span class="pill ${cls}">${escapeHtml(g)}</span>`;
+}
+
+function metricCols(rows) {
+  const keys = new Set();
+  for (const r of rows) Object.keys(r.means || {}).forEach(k => keys.add(k));
+  return Array.from(keys).sort();
+}
+
+function renderSummary(d) {
+  const rows = d.summary || [];
+  let html = `<h2>${escapeHtml(d.path || d.root_name)} <span style="color:var(--muted);font-weight:400;">— ${rows.length} run${rows.length === 1 ? '' : 's'}</span></h2>`;
+  if (!rows.length) return html + '<p class="empty">No runs found in this folder.</p>';
+
+  const cols = metricCols(rows);
+  html += '<div style="overflow-x:auto;"><table><thead><tr>';
+  html += '<th>run_id</th><th>driver</th><th>split</th><th>status</th><th>started</th>';
+  html += '<th>composite</th>';
+  for (const k of cols) html += `<th>${escapeHtml(k)}</th>`;
+  html += '<th>gate</th><th>decision</th></tr></thead><tbody>';
+  for (const r of rows) {
+    html += `<tr class="row" data-path="${escapeHtml(r.path)}">`;
+    html += `<td>${escapeHtml(r.run_id)}</td>`;
+    html += `<td>${escapeHtml(r.driver || '')}</td>`;
+    html += `<td>${escapeHtml(r.split || '')}</td>`;
+    html += `<td>${escapeHtml(r.status || '')}</td>`;
+    html += `<td>${escapeHtml(r.started_at || '')}</td>`;
+    html += `<td class="composite">${fmt(r.composite, 4)}</td>`;
+    for (const k of cols) {
+      const v = (r.means || {})[k];
+      html += `<td class="metric">${fmt(v, 3)}</td>`;
+    }
+    html += `<td>${gatePill(r.single_run_gate)}</td>`;
+    html += `<td>${decisionPill(r.decision)}</td>`;
+    html += '</tr>';
+  }
+  html += '</tbody></table></div>';
+  return html;
+}
+
+function renderScores(scores) {
+  if (!scores || !Object.keys(scores).length) return '<span class="hint">no scores</span>';
+  return Object.entries(scores).map(([k, v]) => `${escapeHtml(k)}=<b>${fmt(v, 3)}</b>`).join(' · ');
+}
+
+function renderJudge(judge) {
+  if (!judge) return '';
+  return Object.entries(judge).map(([k, v]) => `${escapeHtml(k)}=${escapeHtml(String(v))}`).join(' · ');
+}
+
+function renderRun(d) {
+  const run = d.run || {};
+  const agg = d.aggregate || {};
+  const gate = d.gate || {};
+  const cfg = d.config || {};
+  let html = `<div class="heading"><h2>${escapeHtml(run.run_id || '(unnamed run)')}</h2>`;
+  html += decisionPill(gate.decision);
+  html += gatePill(gate.single_run_gate);
+  html += '</div>';
+  html += `<p class="meta-row">`;
+  html += `<b>${escapeHtml(run.driver || '?')}</b> · `;
+  html += `harness=<code>${escapeHtml(run.harness_variant || '?')}</code> · `;
+  html += `split=<code>${escapeHtml(run.split || '?')}</code> · `;
+  html += `seeds=<code>${escapeHtml(JSON.stringify(run.seeds || []))}</code> · `;
+  html += `status=<b>${escapeHtml(run.status || '?')}</b>`;
+  html += '</p>';
+  html += `<p class="meta-row">`;
+  html += `composite=<b>${fmt(agg.composite, 4)}</b>`;
+  if (agg.means) html += ` · means: ${renderScores(agg.means)}`;
+  html += '</p>';
+  if (run.hypothesis) html += `<p class="meta-row"><i>${escapeHtml(run.hypothesis)}</i></p>`;
+  if (run.takeaway) html += `<p class="meta-row">→ ${escapeHtml(run.takeaway)}</p>`;
+
+  if (gate && Object.keys(gate).length) {
+    html += '<details><summary>gate detail</summary><pre>' + escapeHtml(JSON.stringify(gate, null, 2)) + '</pre></details>';
+  }
+  if (cfg && Object.keys(cfg).length) {
+    html += '<details><summary>config</summary><pre>' + escapeHtml(JSON.stringify(cfg, null, 2)) + '</pre></details>';
+  }
+
+  const imgs = d.images || [];
+  html += `<h3>Per-image (${imgs.length})</h3>`;
+  if (!imgs.length) return html + '<p class="empty">no images recorded</p>';
+
+  html += '<div class="grid">';
+  for (const img of imgs) {
+    html += `<div class="card"><h4>${escapeHtml(img.image_id)}</h4>`;
+    html += '<div class="pair">';
+    if (img.target_url) {
+      html += `<figure><a href="${img.target_url}" target="_blank"><img src="${img.target_url}" alt="target"></a><figcaption>target</figcaption></figure>`;
+    } else {
+      html += '<figure><div style="height:140px;display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:12px;">target unavailable</div><figcaption>target</figcaption></figure>';
+    }
+    if (img.generated_url) {
+      html += `<figure><a href="${img.generated_url}" target="_blank"><img src="${img.generated_url}" alt="generated"></a><figcaption>generated</figcaption></figure>`;
+    } else {
+      html += '<figure><div style="height:140px;display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:12px;">no generated.png</div><figcaption>generated</figcaption></figure>';
+    }
+    html += '</div>';
+    html += `<div class="scores">${renderScores(img.scores)}</div>`;
+    if (img.judge) html += `<div class="scores" style="color:var(--muted);">judge: ${renderJudge(img.judge)}</div>`;
+    if (img.seeds && img.seeds.length) {
+      html += '<details><summary>per-seed (' + img.seeds.length + ')</summary>';
+      for (const s of img.seeds) {
+        html += `<div style="margin-top:6px;">seed ${escapeHtml(s.seed)}: ${renderScores(s.scores)}`;
+        if (s.generated_url) html += ` <a href="${s.generated_url}" target="_blank">image</a>`;
+        html += '</div>';
+      }
+      html += '</details>';
+    }
+    if (img.prompt) {
+      html += `<details><summary>prompt (${img.prompt.length} chars)</summary><pre>${escapeHtml(img.prompt)}</pre></details>`;
+    }
+    html += '</div>';
+  }
+  html += '</div>';
+  return html;
+}
+
+document.addEventListener('click', (e) => {
+  const a = e.target.closest('[data-path]');
+  if (!a) return;
+  e.preventDefault();
+  const path = a.getAttribute('data-path');
+  history.pushState({path}, '', '#' + encodeURIComponent(path));
+  loadPath(path);
+});
+
+window.addEventListener('popstate', () => {
+  const path = decodeURIComponent(location.hash.slice(1)) || '';
+  loadPath(path);
+});
+
+const initial = decodeURIComponent(location.hash.slice(1)) || '';
+loadPath(initial);
+</script>
+</body>
+</html>
+"""
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self) -> None:  # noqa: N802
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/":
+            return self._send_html(INDEX_HTML)
+        if parsed.path == "/api/inspect":
+            return self._handle_inspect(parsed)
+        if parsed.path == "/api/file":
+            return self._handle_file(parsed)
+        self.send_error(404, "not found")
+
+    def _handle_inspect(self, parsed: urllib.parse.ParseResult) -> None:
+        qs = urllib.parse.parse_qs(parsed.query)
+        try:
+            target = resolve_safe(qs.get("path", [""])[0])
+        except PermissionError as exc:
+            return self._send_json({"error": str(exc)}, status=403)
+        if not target.exists():
+            return self._send_json({"error": f"not found: {qs.get('path', [''])[0]}"}, status=404)
+        if not target.is_dir():
+            return self._send_json({"error": "not a directory"}, status=400)
+        return self._send_json(inspect_dir(target))
+
+    def _handle_file(self, parsed: urllib.parse.ParseResult) -> None:
+        qs = urllib.parse.parse_qs(parsed.query)
+        try:
+            target = resolve_safe(qs.get("path", [""])[0])
+        except PermissionError as exc:
+            return self.send_error(403, str(exc))
+        if not target.is_file():
+            return self.send_error(404, "file not found")
+        ctype = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
+        try:
+            size = target.stat().st_size
+        except OSError as exc:
+            return self.send_error(500, str(exc))
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(size))
+        self.send_header("Cache-Control", "private, max-age=60")
+        self.end_headers()
+        try:
+            with target.open("rb") as f:
+                while True:
+                    chunk = f.read(64 * 1024)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def _send_html(self, body: str) -> None:
+        body_bytes = body.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body_bytes)))
+        self.end_headers()
+        self.wfile.write(body_bytes)
+
+    def _send_json(self, payload: Any, status: int = 200) -> None:
+        body = json.dumps(payload, default=str).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, fmt: str, *args: Any) -> None:
+        sys.stderr.write("[%s] %s\n" % (self.log_date_time_string(), fmt % args))
+
+
+class ThreadingServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--root", type=Path, default=Path.cwd(),
+                        help="directory to serve (default: cwd)")
+    parser.add_argument("--port", type=int, default=8765, help="port (default: 8765)")
+    parser.add_argument("--host", default="127.0.0.1",
+                        help="bind host (default: 127.0.0.1; use 0.0.0.0 to expose on LAN)")
+    parser.add_argument("--open", action="store_true",
+                        help="open the viewer in the default browser on start")
+    args = parser.parse_args(argv)
+
+    global ROOT
+    ROOT = args.root.resolve()
+    if not ROOT.is_dir():
+        print(f"--root {ROOT} is not a directory", file=sys.stderr)
+        return 1
+
+    server = ThreadingServer((args.host, args.port), Handler)
+    url = f"http://{args.host}:{args.port}/"
+    print(f"Serving {ROOT} at {url}", file=sys.stderr)
+    if args.open:
+        threading.Timer(0.5, lambda: webbrowser.open(url)).start()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("shutting down", file=sys.stderr)
+    finally:
+        server.server_close()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
