@@ -120,8 +120,6 @@ eval_data/images/val/       ← canonical 5-image validation split
 eval_data/images/train/     ← schema split, may stay empty for this harness
 eval_data/images/holdout/   ← schema split, keep private/empty here
 eval_data/images/manifest.json
-eval_images/                ← optional compatibility symlink to eval_data/images/eval
-val_images/                 ← optional compatibility symlink to eval_data/images/val
 experiments/          ← canonical schema runtime outputs
 cache/                ← auto-created at runtime, git-ignored
 runs/                 ← compatibility symlink/copy to experiments/runs
@@ -155,8 +153,6 @@ Do this top to bottom. Don't skip the smoke test in step 9.
    `eval_data/images/{train,eval,val,holdout}` and
    `eval_data/images/manifest.json`.
    If empty, see section 9 — likely requires pausing to ask the human.
-   If older commands or docs need them, create `eval_images` and `val_images`
-   as symlinks to `eval_data/images/eval` and `eval_data/images/val`.
 8. **Prepare driver agent context files.** The prepared task may start
    with implementation-phase `AGENTS.md`, `CLAUDE.md`, and `GEMINI.md`
    wrappers so auto-loaded context does not fight this bootstrap phase.
@@ -179,8 +175,7 @@ Implement the canonical layout under `experiments/` and either:
   diverge.
 
 Likewise, `eval_data/images/eval` and `eval_data/images/val` are the only real
-places for benchmark images. If `eval_images/` or `val_images/` exist, they
-must be symlinks to those canonical directories, not independent copies.
+places for benchmark images.
 `python check_eval_storage.py --root .` must pass after eval artifacts exist.
 
 ## 5. `pyproject.toml`

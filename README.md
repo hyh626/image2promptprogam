@@ -90,8 +90,6 @@ Since some spec variants use older local names, the script may create symlink
 compatibility shortcuts when a selected spec mentions them:
 
 ```text
-eval_images -> eval_data/images/eval
-val_images  -> eval_data/images/val
 target_image.png  # copied from the first image found in eval_data/images/eval
 prompt.txt        # starter prompt for single-target specs
 ```
