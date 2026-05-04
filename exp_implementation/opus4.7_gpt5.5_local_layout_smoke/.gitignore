@@ -1,0 +1,17 @@
+.env
+/weights/
+/cache/
+/runs/
+__pycache__/
+*.pyc
+/.venv/
+experiments/runs/*
+!experiments/runs/.gitkeep
+experiments/cache/*
+!experiments/cache/.gitkeep
+eval_data/images/*/*.png
+eval_data/images/*/*.jpg
+eval_data/images/*/*.jpeg
+eval_data/images/*/*.webp
+eval_data/images/*/*.bmp
+eval_data/images/*/*.gif

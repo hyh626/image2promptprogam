@@ -1,0 +1,21 @@
+Read program.md and the latest entries in logbook.md. You are the
+driver agent. The harness is already built — you only edit
+prompt_strategy.py and append to logbook.md.
+
+For each experiment: re-read logbook.md, write a one-sentence
+hypothesis, edit prompt_strategy.py, run
+`uv run harness.py --name <slug>`, and read the per-metric
+breakdown (s_gemini / s_dino / s_lpips / s_color), not just the
+composite. Let the anti-Goodhart gate (epsilon=0.01 per metric +
+composite improvement) decide promotion; the harness will run the
+multi-seed re-eval automatically, with at least 3 generation/scoring
+repeats per eval image. After every ~10 promoted leaders, run
+`uv run harness.py --val` to check for overfitting.
+
+Aim for at least 20 experiments this session (hard cap 50).
+Prioritize qualitatively different strategies (decomposition,
+iterative refinement, terse prompts, few-shot, thinking levels)
+over local optimization of one approach. Record your driver model
+in the `driver:` field of every logbook entry. Do not modify the
+harness, the eval/val sets, or the model identifiers. Do not
+optimize against the VLM-judge scores — they are diagnostic only.
