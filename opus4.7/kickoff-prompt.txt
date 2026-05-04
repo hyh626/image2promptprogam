@@ -1,18 +1,24 @@
-Read IMPLEMENTATION.md first, then read program.md.
+Read IMPLEMENTATION.md first, then read program.md. Also read
+EVAL_STORAGE_SCHEMA.md before implementing any run, score, aggregate, gate, or
+leader persistence logic.
 
 Build the harness described in this prepared task folder. Treat
 IMPLEMENTATION.md as the implementation contract and program.md as the
-user-facing research contract. Use only the visible data included in this
-folder; do not fetch, infer, or use holdout data.
+user-facing research contract. Treat EVAL_STORAGE_SCHEMA.md as the canonical
+storage contract for eval artifacts, and implement the harness logic so all
+written eval data follows that schema. Use only the visible data included in
+this folder; do not fetch, infer, or use holdout data.
 
 Follow the repo shape, commands, model roles, scoring rules, and workflow
 described by this folder's docs. If the docs and this kickoff prompt disagree,
-the docs win.
+the docs win. For eval storage layout and metadata files,
+EVAL_STORAGE_SCHEMA.md wins over all other docs.
 
 When you are done, run the required tests or smoke checks if credentials,
-dependencies, and data are available. If anything external is missing, stop
-cleanly and report exactly what is blocked and what command should be rerun
-after it is supplied.
+dependencies, and data are available. Include the eval storage checker,
+`python check_eval_storage.py --root .`, after producing any eval artifacts.
+If anything external is missing, stop cleanly and report exactly what is
+blocked and what command should be rerun after it is supplied.
 
 Finish with a concise handoff listing what you built, what passed or could not
 run, and the exact command the next agent or user should run.

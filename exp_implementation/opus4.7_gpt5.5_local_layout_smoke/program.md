@@ -47,8 +47,6 @@ harness.py            ← runs the eval loop. DO NOT MODIFY.
 embed_and_score.py    ← four similarity metrics + compositing. DO NOT MODIFY.
 eval_data/images/eval/ ← 20 fixed reference images. DO NOT MODIFY.
 eval_data/images/val/  ← 5 held-out images. DO NOT MODIFY.
-eval_images/           ← optional compatibility symlink to eval_data/images/eval.
-val_images/            ← optional compatibility symlink to eval_data/images/val.
 cache/                ← cached features for original images
 runs/                 ← per-experiment artifacts
 weights/              ← downloaded local model weights
@@ -94,7 +92,7 @@ Per experiment cost scales with `--seeds`; the default 3-seed run is roughly
 Other CLI flags:
 
 ```bash
-uv run harness.py --val           # run on eval_data/images/val, no promotion
+uv run harness.py --val           # run on eval_data/images/val/, no promotion
 uv run harness.py --name <n> --seeds N   # run N seeds per image, N >= 3
 ```
 
@@ -225,8 +223,8 @@ prompts). Diversity is a goal, not a side effect.
 ## What NOT to do
 
 - Do not modify `harness.py`, `embed_and_score.py`,
-  `eval_data/images/eval/`, or `eval_data/images/val/`. These define the
-  benchmark.
+  `eval_data/images/eval/`, or `eval_data/images/val/`. These define
+  the benchmark.
 - Do not change the image generator model, the embedding model, the
   local metric models, or the canonical 448×448 resolution.
   Comparability across experiments depends on these being fixed.

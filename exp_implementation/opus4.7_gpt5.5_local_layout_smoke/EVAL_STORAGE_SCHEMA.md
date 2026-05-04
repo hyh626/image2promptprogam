@@ -72,8 +72,7 @@ definitions.
 
 - `<image_id>` is the basename of the source image, **without
   extension**, lowercased, with spaces replaced by `_`. Example:
-  `eval_data/images/eval/Hero Photo 01.PNG` →
-  `image_id = "hero_photo_01"`.
+  `eval_data/images/eval/Hero Photo 01.PNG` → `image_id = "hero_photo_01"`.
 - `<run_id>` is `<UTC-timestamp>__<driver>__<name>` where
   `<UTC-timestamp>` is `YYYYMMDDTHHMMSSZ`, `<driver>` is a slugged
   agent identifier (e.g. `claude-opus-4-7`, `gpt-5`, `gemini-3-1-pro`),
@@ -87,9 +86,8 @@ definitions.
 
 ### What is committed vs. ignored
 
-- **Committed:** `eval_data/images/manifest.json`,
-  `experiments/logbook.md`, `experiments/leader/pointer.json`,
-  `experiments/leader/history.jsonl`.
+- **Committed:** `eval_data/images/manifest.json`, `logbook.md`,
+  `experiments/leader/pointer.json`, `experiments/leader/history.jsonl`.
 - **Gitignored:** `eval_data/images/*/*.png`, `experiments/runs/`,
   `experiments/cache/`, `weights/`. (Image bytes are large, run
   artifacts are reproducible.)
