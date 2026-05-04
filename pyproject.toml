@@ -1,0 +1,20 @@
+[project]
+name = "image2promptprogam-tools"
+version = "0.0.0"
+description = "Repo-level helpers: storage schema checker, results viewer, GCS sync."
+requires-python = ">=3.10"
+# Runtime tools (check_eval_storage.py, view_eval_results.py without GCS)
+# are stdlib-only. GCS support requires google-cloud-storage; tests stub it.
+dependencies = []
+
+[project.optional-dependencies]
+gcs = ["google-cloud-storage>=2.0"]
+dev = [
+  "pytest>=7.0",
+  "google-cloud-storage>=2.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-q"
