@@ -1,25 +1,22 @@
-Read program.md first. Skim IMPLEMENTATION.md only for repo-specific
-constraints; do not rebuild the harness unless program.md explicitly tells you
-to.
+Read program.md and any prior run reports under outputs/runs/. You
+are the driver agent. The harness is already built — you only edit
+configs and prompt-strategy inputs, and append findings to each
+run's report.md.
 
-You are now the autoresearch driver. Use the harness already present in this
-folder and follow program.md as the source of truth. Use only the visible data
-included in this task folder; do not fetch, infer, or use holdout data.
+For each experiment: re-read the latest run report, write a
+one-sentence hypothesis, edit the structured-prompt schema or
+search config, run the runner CLI per program.md, and read the
+per-component breakdown (whole-image embedding / region embedding
+/ VLM judge), not just the composite. Use beam search defaults
+(B=3, K=4 mutations, max_iterations=8) and re-evaluate finalists
+across 3+ seeds before declaring an improvement.
 
-Before each experiment, read the existing logbook or run history if one exists,
-then write one concise hypothesis. Modify only the research surface allowed by
-this folder's docs. Do not change harness code, scoring logic, benchmark data,
-or fixed model/generation settings unless the docs explicitly define that as
-part of the experiment.
-
-Run the experiment command described by program.md, inspect the metric
-breakdown and saved artifacts, and keep, promote, or revert changes according
-to the repo's rules. Log every experiment with enough detail for the next agent
-to understand what was tried and what happened.
-
-Prefer qualitatively different experiments over tiny local tweaks. If a run is
-blocked by missing API keys, dependencies, data, or permissions, stop cleanly
-and report the exact blocker and the command to rerun after it is fixed.
-
-Finish the session with a concise summary of the best result, what worked,
-what failed or regressed, and the next experiments worth trying.
+Aim for at least 20 experiments this session. Prioritize
+qualitatively different strategies (structured-vs-freeform,
+critique-guided vs blind mutation, region-aware vs whole-image
+ranking, prompt length, negative prompts) over local optimization
+of one approach. Record which schema field changed and why in
+`mutation_rationale` for every candidate. Do not modify core code
+under src/, scoring, API wrappers, target images, or generator
+settings (model, resolution, seed policy). Do not chase a single
+lucky seed.
