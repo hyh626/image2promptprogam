@@ -1,0 +1,25 @@
+Read program.md first. Skim IMPLEMENTATION.md only for repo-specific
+constraints; do not rebuild the harness unless program.md explicitly tells you
+to.
+
+You are now the autoresearch driver. Use the harness already present in this
+folder and follow program.md as the source of truth. Use only the visible data
+included in this task folder; do not fetch, infer, or use holdout data.
+
+Before each experiment, read the existing logbook or run history if one exists,
+then write one concise hypothesis. Modify only the research surface allowed by
+this folder's docs. Do not change harness code, scoring logic, benchmark data,
+or fixed model/generation settings unless the docs explicitly define that as
+part of the experiment.
+
+Run the experiment command described by program.md, inspect the metric
+breakdown and saved artifacts, and keep, promote, or revert changes according
+to the repo's rules. Log every experiment with enough detail for the next agent
+to understand what was tried and what happened.
+
+Prefer qualitatively different experiments over tiny local tweaks. If a run is
+blocked by missing API keys, dependencies, data, or permissions, stop cleanly
+and report the exact blocker and the command to rerun after it is fixed.
+
+Finish the session with a concise summary of the best result, what worked,
+what failed or regressed, and the next experiments worth trying.

@@ -1,0 +1,18 @@
+Read IMPLEMENTATION.md first, then read program.md.
+
+Build the harness described in this prepared task folder. Treat
+IMPLEMENTATION.md as the implementation contract and program.md as the
+user-facing research contract. Use only the visible data included in this
+folder; do not fetch, infer, or use holdout data.
+
+Follow the repo shape, commands, model roles, scoring rules, and workflow
+described by this folder's docs. If the docs and this kickoff prompt disagree,
+the docs win.
+
+When you are done, run the required tests or smoke checks if credentials,
+dependencies, and data are available. If anything external is missing, stop
+cleanly and report exactly what is blocked and what command should be rerun
+after it is supplied.
+
+Finish with a concise handoff listing what you built, what passed or could not
+run, and the exact command the next agent or user should run.
