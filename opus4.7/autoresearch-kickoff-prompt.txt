@@ -8,8 +8,9 @@ hypothesis, edit prompt_strategy.py, run
 breakdown (s_gemini / s_dino / s_lpips / s_color), not just the
 composite. Let the anti-Goodhart gate (epsilon=0.01 per metric +
 composite improvement) decide promotion; the harness will run the
-3-seed re-eval automatically. After every ~10 promoted leaders,
-run `uv run harness.py --val` to check for overfitting.
+multi-seed re-eval automatically, with at least 3 generation/scoring
+repeats per eval image. After every ~10 promoted leaders, run
+`uv run harness.py --val` to check for overfitting.
 
 Aim for at least 20 experiments this session (hard cap 50).
 Prioritize qualitatively different strategies (decomposition,

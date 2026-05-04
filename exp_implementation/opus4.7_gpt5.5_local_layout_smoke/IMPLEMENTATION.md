@@ -115,9 +115,9 @@ per experiment.
 prompt_strategy.py    ← baseline you ship; driver iterates on it
 harness.py            ← you implement
 embed_and_score.py    ← you implement
-eval_images/          ← human will populate; do not auto-fill
-val_images/           ← human will populate; do not auto-fill
-eval_data/            ← canonical schema input registry and manifests
+eval_data/images/eval/ ← human will populate; do not auto-fill
+eval_data/images/val/  ← human will populate; do not auto-fill
+eval_data/             ← canonical schema input registry and manifests
 experiments/          ← canonical schema runtime outputs
 cache/                ← auto-created at runtime, git-ignored
 runs/                 ← compatibility symlink/copy to experiments/runs
@@ -147,11 +147,11 @@ Do this top to bottom. Don't skip the smoke test in step 9.
 4. **Implement `embed_and_score.py`** per section 6.
 5. **Implement `harness.py`** per section 7.
 6. **Ship the baseline `prompt_strategy.py`** per section 8.
-7. **Set up image directories.** `mkdir -p eval_images val_images`.
+7. **Set up image directories.**
+   `mkdir -p eval_data/images/eval eval_data/images/val`.
    If empty, see section 9 — likely requires pausing to ask the human.
-   Also set up the canonical `eval_data/images/` manifest paths required by
-   `EVAL_STORAGE_SCHEMA.md`; keep `eval_images/` and `val_images/` as
-   compatibility paths for this spec.
+   The canonical `eval_data/images/` manifest paths required by
+   `EVAL_STORAGE_SCHEMA.md` are the only image input paths.
 8. **Prepare driver agent context files.** The prepared task may start
    with implementation-phase `AGENTS.md`, `CLAUDE.md`, and `GEMINI.md`
    wrappers so auto-loaded context does not fight this bootstrap phase.
@@ -173,10 +173,9 @@ Implement the canonical layout under `experiments/` and either:
 - write both paths from one shared persistence layer without allowing them to
   diverge.
 
-Likewise, keep `eval_images/` and `val_images/` usable for this spec, but build
-the canonical `eval_data/images/manifest.json` and split directories required
-by the schema. `python check_eval_storage.py --root .` must pass after eval
-artifacts exist.
+Build the canonical `eval_data/images/manifest.json` and split directories
+required by the schema. `python check_eval_storage.py --root .` must pass
+after eval artifacts exist.
 
 ## 5. `pyproject.toml`
 
@@ -342,7 +341,8 @@ uv run harness.py --name <name> [--val] [--seeds N] [--no-judge]
 
 - `--name <name>`: short identifier for the run. Required unless
   `--val`.
-- `--val`: run on `val_images/` instead of `eval_images/`. No
+- `--val`: run on `eval_data/images/val/` instead of
+  `eval_data/images/eval/`. No
   promotion logic. Prints scores only.
 - `--seeds N`: run generation and scoring N times per target image
   with different generation seeds, aggregate per-image scores across
@@ -520,7 +520,7 @@ different specific content. If eval has a flat-vector "growth chart"
 illustration, val should have a flat-vector "team meeting"
 illustration — same archetype, different content.
 
-### If `eval_images/` is empty when you reach this step
+### If `eval_data/images/eval/` is empty when you reach this step
 
 **Stop and ask the human.** Do not scrape, generate, or auto-fill
 substitutes. The eval set is the most consequential decision in the
@@ -530,18 +530,19 @@ experiment afterward.
 A reasonable hand-off message at that point:
 
 > The harness is built and the smoke test for `embed_and_score.py`
-> passes. I need you to populate `eval_images/` with 20 reference
-> images and `val_images/` with 5 held-out images before I can run
+> passes. I need you to populate `eval_data/images/eval/` with 20 reference
+> images and `eval_data/images/val/` with 5 held-out images before I can run
 > the end-to-end smoke test. See IMPLEMENTATION.md section 9 for
 > the recommended distribution. Once images are in place, I'll
 > re-run the smoke test and finish handoff.
 
 ### Validation checks (run after the human populates the directories)
 
-- All files in `eval_images/` and `val_images/` load with PIL.
+- All files in `eval_data/images/eval/` and `eval_data/images/val/` load with PIL.
 - All images are at least 512×512.
 - No transparent backgrounds (will confuse generation).
-- No duplicate sha256s between `eval_images/` and `val_images/`.
+- No duplicate sha256s between `eval_data/images/eval/` and
+  `eval_data/images/val/`.
 - File count is exactly 20 and 5.
 
 If any check fails, stop and report.
@@ -569,7 +570,7 @@ If this fails, fix before proceeding. Common failure modes:
 
 ### Test 2: full harness on at least one image
 
-If the human has populated `eval_images/` with at least one image:
+If the human has populated `eval_data/images/eval/` with at least one image:
 
 ```bash
 uv run harness.py --name smoke_test --no-judge
@@ -582,7 +583,7 @@ writes `runs/smoke_test/`, and promotes itself as the first leader
 (since there's no previous leader). If this fails, fix before
 handing off.
 
-If `eval_images/` is empty, skip Test 2 and note in the handoff
+If `eval_data/images/eval/` is empty, skip Test 2 and note in the handoff
 that it could not be run.
 
 ## 11. Definition of done
@@ -592,7 +593,7 @@ Hand off only when ALL of these are true:
 - [ ] `uv sync` succeeds from a clean clone.
 - [ ] Smoke test 1 passes (`featurize` returns the four expected
       keys).
-- [ ] Smoke test 2 passes if `eval_images/` is populated
+- [ ] Smoke test 2 passes if `eval_data/images/eval/` is populated
       (full harness run completes end-to-end).
 - [ ] Eval and val runs validate `--seeds >= 3` and generate, score,
       aggregate, and persist at least three per-seed results for each
@@ -615,10 +616,10 @@ Write a short message to the human covering:
 1. What was built (one sentence).
 2. Whether smoke test 2 was run; if not, what's blocking it.
 3. What the human should do next:
-   - If `eval_images/` is empty: populate it per section 9, then
+   - If `eval_data/images/eval/` is empty: populate it per section 9, then
      run `uv run harness.py --name baseline_check` to verify the
      baseline.
-   - If `eval_images/` was populated and smoke test 2 passed: the
+   - If `eval_data/images/eval/` was populated and smoke test 2 passed: the
      harness is ready; launch their preferred coding agent with
      the kickoff prompt from `program.md` "Session entrypoint".
 4. Any deviations you made from this spec, with brief justification.

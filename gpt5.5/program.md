@@ -77,13 +77,13 @@ Changing generation settings mid-run makes the experiment hard to interpret. If 
 Place target images under:
 
 ```text
-data/targets/
+eval_data/images/eval/
 ```
 
 Recommended starting set:
 
 ```text
-data/targets/
+eval_data/images/eval/
   easy/
   medium/
   hard/
@@ -107,7 +107,7 @@ A typical run config should define:
 
 ```yaml
 experiment_name: single_image_debug
-target_glob: data/targets/easy/*.png
+target_glob: eval_data/images/eval/easy/*.png
 
 models:
   embedding: gemini-embedding-model
@@ -116,7 +116,8 @@ models:
 
 generation:
   aspect_ratio: "1:1"
-  num_images_per_prompt: 1
+  num_images_per_prompt: 3
+  min_images_per_prompt: 3
   seed_policy: fixed_or_random
   negative_prompt_enabled: true
 
@@ -144,7 +145,7 @@ Example:
 ```bash
 python -m image_prompt_search.runner \
   --config configs/single_image.yaml \
-  --target data/targets/easy/example.png
+  --target eval_data/images/eval/easy/example.png
 ```
 
 The first run should be treated as a debugging run. Verify that:
@@ -164,7 +165,7 @@ After the single-image loop works, run a small benchmark:
 ```bash
 python -m image_prompt_search.runner \
   --config configs/benchmark_small.yaml \
-  --target-glob "data/targets/**/*.png"
+  --target-glob "eval_data/images/eval/**/*.png"
 ```
 
 Start with 5 target images, then scale to 20–50 images after cost and logging are stable.
@@ -188,11 +189,14 @@ Good initial values:
 beam_width = 2 or 3
 mutations_per_prompt = 3 or 4
 max_iterations = 8
-num_images_per_prompt = 1 during search
+num_images_per_prompt = 3 during search
 final_reeval_seeds = 3 to 5
 ```
 
-Early search should be cheap. Use multiple seeds only for finalists or late-stage candidates.
+Early search should stay cheap by keeping beam width and mutation count modest,
+but every real candidate evaluation still generates and scores at least 3
+images per target/example. Use more than 3 seeds only for finalists or
+late-stage candidates.
 
 ## Prompt Representation
 

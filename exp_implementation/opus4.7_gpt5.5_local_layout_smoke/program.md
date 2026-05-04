@@ -45,8 +45,8 @@ Don't confuse the two roles.
 prompt_strategy.py    ← the ONLY file you edit
 harness.py            ← runs the eval loop. DO NOT MODIFY.
 embed_and_score.py    ← four similarity metrics + compositing. DO NOT MODIFY.
-eval_images/          ← 20 fixed reference images. DO NOT MODIFY.
-val_images/           ← 5 held-out images. DO NOT MODIFY.
+eval_data/images/eval/ ← 20 fixed reference images. DO NOT MODIFY.
+eval_data/images/val/  ← 5 held-out images. DO NOT MODIFY.
 cache/                ← cached features for original images
 runs/                 ← per-experiment artifacts
 weights/              ← downloaded local model weights
@@ -75,7 +75,7 @@ multiple API calls internally.
 uv run harness.py --name <short_descriptive_name>
 ```
 
-For each of the 20 images in `eval_images/`, the harness:
+For each of the 20 images in `eval_data/images/eval/`, the harness:
 
 1. Calls `image_to_prompt(image)` to get a prompt.
 2. Calls Nano Banana 2 with that prompt for each configured generation
@@ -92,7 +92,7 @@ Per experiment cost scales with `--seeds`; the default 3-seed run is roughly
 Other CLI flags:
 
 ```bash
-uv run harness.py --val           # run on val_images/, no promotion
+uv run harness.py --val           # run on eval_data/images/val/, no promotion
 uv run harness.py --name <n> --seeds N   # run N seeds per image, N >= 3
 ```
 
@@ -147,7 +147,7 @@ multi-seed mean must still pass the gate. Otherwise, revert.
 
 ### Held-out validation
 
-`uv run harness.py --val` runs the full pipeline on `val_images/`
+`uv run harness.py --val` runs the full pipeline on `eval_data/images/val/`
 without promotion logic. Run this every ~10 promoted leaders. If
 `composite_eval` is climbing but `composite_val` is flat or dropping,
 you are overfitting to the eval set — back off and try something
@@ -222,8 +222,9 @@ prompts). Diversity is a goal, not a side effect.
 
 ## What NOT to do
 
-- Do not modify `harness.py`, `embed_and_score.py`, `eval_images/`, or
-  `val_images/`. These define the benchmark.
+- Do not modify `harness.py`, `embed_and_score.py`,
+  `eval_data/images/eval/`, or `eval_data/images/val/`. These define
+  the benchmark.
 - Do not change the image generator model, the embedding model, the
   local metric models, or the canonical 448×448 resolution.
   Comparability across experiments depends on these being fixed.

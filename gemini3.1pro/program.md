@@ -1,8 +1,55 @@
-Vision-Ratchet: Autonomous Prompt-to-Image AutoResearchWelcome to Vision-Ratchet. This system is an automated, iterative loop designed to discover the exact text prompt required to perfectly reproduce a given target image using state-of-the-art image generation models.Inspired by Andrej Karpathy's autoresearch for code, Vision-Ratchet replaces manual prompt engineering with an autonomous Vision-Language Model (VLM) agent that hypothesizes, generates, scores, and refines prompts without human supervision.1. How It Works: The "Karpathy Loop" for ImagesThe system utilizes a simple, Git-style "Ratchet" mechanism to ensure monotonic improvement. The workflow operates as follows:Read & Hypothesize: The agent examines the target image, the currently generated image, and the current text prompt. It formulates a hypothesis on how to modify the prompt to fix one specific visual discrepancy (e.g., lighting, texture, spatial placement).Edit: The agent updates the prompt.txt file.Generate: The system uses the new prompt to generate a new image.Evaluate: The system mathematically compares the new generation to the target image.Decide (The Ratchet):Success: If the visual similarity score improves, the new prompt is kept. This becomes the new baseline.Failure: If the score decreases (or visual drift occurs), the system immediately reverts (git reset --hard equivalent) to the last known best prompt.txt.Repeat: The loop runs continuously, refining the prompt step-by-step.2. Setting Up an ExperimentAssuming the core harness (main.py) has been implemented, setting up a new research run is designed to be frictionless.Prerequisites in your WorkspaceYour experiment directory must contain the following:main.py: The execution harness (provided by the implementation agent).target_image.png (or .jpg): The ground-truth image you are attempting to reverse-engineer.prompt.txt: Your starting text prompt.Step 1: Provide the Target ImagePlace the image you want to replicate into the root directory and name it target_image.png.Step 2: Initialize the Baseline PromptWrite a foundational, "zero-shot" prompt in prompt.txt.Example: A highly detailed photograph of a rusty red bicycle leaning against a brick wall, cinematic lighting.Tip: You can use a standard VLM to generate this initial guess.Step 3: Run the AutoResearch LoopExecute the harness. You can specify the number of iterations you want the agent to run.python main.py --iterations 100
-3. What to Expect OvernightOnce the process is running, you can walk away. The agent will execute roughly 100 experiments over a few hours.Artifacts Produced:workspace/ Directory: Contains all generated images from the loop (e.g., gen_001.png, gen_002.png).history.log: A CSV file tracking the iteration number, the similarity score, the proposed prompt, and whether the change was "Kept" or "Reverted".prompt.txt: At the end of the run, this file will contain the highly optimized, exact text prompt required to reproduce your target image.
+# Vision-Ratchet Autoresearch
 
-## 4. Kickoff Prompt
+Vision-Ratchet is an autonomous prompt-engineering loop for discovering the
+text prompt needed to reproduce a target image with a fixed image generator.
+
+The harness has already been implemented when this document is used by the
+research/driver agent. The driver edits `prompt.txt`, runs the harness, reads
+the score trajectory, and decides whether to continue, restart, or stop.
+
+## Canonical Data Storage
+
+`EVAL_STORAGE_SCHEMA.md` is authoritative for on-disk data and run artifacts.
+For this single-target workflow, place the target image under:
+
+```text
+eval_data/images/eval/
+```
+
+`target_image.png` is only a compatibility shortcut to the canonical target
+file. Durable run outputs should be bridged into `experiments/` so:
+
+```bash
+python check_eval_storage.py --root .
+```
+
+can pass after eval artifacts exist.
+
+## Workflow
+
+1. Put the target image in `eval_data/images/eval/`.
+2. Keep or create `target_image.png` only as a shortcut to that image if older
+   commands require it.
+3. Write a foundational prompt in `prompt.txt`.
+4. Run the harness:
+
+   ```bash
+   python main.py --iterations 100
+   ```
+
+The harness generates images, scores each generation against the canonical
+target image, keeps prompt changes that improve the aggregate score, and
+reverts prompt changes that regress.
+
+## Artifacts
+
+- `workspace/`: compatibility/debug generated images.
+- `history.log`: compatibility/debug score trajectory.
+- `experiments/`: canonical durable run artifacts.
+- `prompt.txt`: final optimized prompt at the end of the run.
+
+## Kickoff Prompt
 
 Paste the contents of
 [`autoresearch-kickoff-prompt.txt`](autoresearch-kickoff-prompt.txt)
-as the first message to the driver agent (any modern coding CLI).
+as the first message to the driver agent.

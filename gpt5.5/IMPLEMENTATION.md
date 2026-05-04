@@ -102,13 +102,13 @@ Example desired commands:
 ```bash
 python -m image_prompt_search.runner \
   --config configs/single_image.yaml \
-  --target data/targets/easy/example.png
+  --target eval_data/images/eval/easy/example.png
 ```
 
 ```bash
 python -m image_prompt_search.runner \
   --config configs/benchmark_small.yaml \
-  --target-glob "data/targets/**/*.png"
+  --target-glob "eval_data/images/eval/**/*.png"
 ```
 
 Useful flags:
@@ -131,6 +131,14 @@ The CLI should write a complete run directory under:
 outputs/runs/<run_id>/
 ```
 
+`EVAL_STORAGE_SCHEMA.md` is canonical for persisted eval inputs and run
+artifacts. Target images live under `eval_data/images/eval/`; validation images
+live under `eval_data/images/val/`. If this spec uses `outputs/runs/` for
+ergonomics, bridge it to the canonical `experiments/runs/` path with symlinks
+or one shared persistence layer. The implementation must also write the
+canonical manifest/logbook files needed for
+`python check_eval_storage.py --root .` to pass after eval artifacts exist.
+
 ## 6. Configuration
 
 Use YAML or JSON config.
@@ -139,7 +147,7 @@ Suggested config schema:
 
 ```yaml
 experiment_name: single_image_debug
-target_glob: data/targets/easy/*.png
+target_glob: eval_data/images/eval/easy/*.png
 output_dir: outputs/runs
 
 models:
@@ -165,7 +173,8 @@ models:
 generation:
   aspect_ratio: auto
   resolution: null
-  num_images_per_prompt: 1
+  num_images_per_prompt: 3
+  min_images_per_prompt: 3
   seed_policy: random
   fixed_seed: null
   negative_prompt_enabled: true
@@ -207,6 +216,12 @@ cost:
 ```
 
 Implementation should validate config early and fail with clear errors.
+`generation.num_images_per_prompt` is the configurable repeat count for
+candidate evaluation. It must default to `3`, and config validation must reject
+values below `generation.min_images_per_prompt` (`3` by default). For every
+target/example and every candidate prompt that is evaluated, the harness must
+run image generation and scoring at least three times with distinct seeds, then
+aggregate those per-seed scores before ranking or reporting the candidate.
 When `generation.aspect_ratio` is `auto`, infer it from the target image and
 pass the nearest supported aspect ratio to
 `gemini-3.1-flash-image-preview` through its `aspect_ratio` parameter. Do not
@@ -488,13 +503,17 @@ Keep parent/child relationships so the trace can be reconstructed.
 For each candidate:
 
 1. compile prompt text and negative prompt,
-2. generate one or more images,
+2. generate the configured repeat count of images, defaulting to at
+   least three,
 3. score each generation,
 4. aggregate score across images/seeds,
 5. store best generation and aggregate stats,
 6. log all records.
 
-During early search, generate one image per prompt. During final reevaluation, generate 3–5 images per prompt with different seeds.
+During early search, generate and score at least three images per prompt with
+different seeds. During final reevaluation, generate 3–5 images per prompt with
+different seeds. Both counts must be configurable, but neither may be below 3
+for real eval runs.
 
 Aggregation modes:
 
@@ -1052,6 +1071,7 @@ Required tests:
 - beam keeps top candidates,
 - parent/child lineage is preserved,
 - failed candidates do not kill the run,
+- candidate evaluation rejects configured repeat counts below 3,
 - final reevaluation aggregates seeds correctly.
 
 ### Logger
@@ -1100,7 +1120,9 @@ The implementation is acceptable when:
 4. Beam search preserves candidate lineage.
 5. Scoring supports whole-image embedding, region embedding, and VLM judge.
 6. The harness does not rely on a single semantic embedding score.
-7. Final reevaluation supports multiple seeds.
+7. Candidate evaluation and final reevaluation both support configurable
+   multi-seed repeats and reject real eval settings below three generations
+   per target/example.
 8. Configs can enable/disable ablations.
 9. Mock mode tests pass without external APIs.
 10. Real provider hooks are isolated behind interfaces.
@@ -1114,8 +1136,8 @@ The first working demo should use:
 max_iterations = 8
 beam_width = 2
 mutations_per_prompt = 3
-1 generated image per candidate during search
-3 generated images per finalist
+3 generated-and-scored images per candidate during search
+3 generated-and-scored images per finalist
 whole-image embedding + region embedding + VLM judge
 ```
 

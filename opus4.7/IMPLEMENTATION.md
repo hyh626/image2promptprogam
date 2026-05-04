@@ -25,7 +25,8 @@ on prompt-from-image generation. The loop:
    metrics.
 4. Promotes a new prompting strategy only if it strictly improves
    without regressing on any individual metric, and survives a
-   3-seed re-evaluation.
+   configurable multi-seed confirmation re-evaluation with at least
+   three generations per target image.
 
 The methodology follows Andrej Karpathy's
 [autoresearch](https://github.com/karpathy/autoresearch) pattern: one
@@ -111,19 +112,25 @@ per experiment.
 ## 3. Repo layout to create
 
 ```
-prompt_strategy.py    ← baseline you ship; driver iterates on it
-harness.py            ← you implement
-embed_and_score.py    ← you implement
-eval_images/          ← human will populate; do not auto-fill
-val_images/           ← human will populate; do not auto-fill
+prompt_strategy.py          ← baseline you ship; driver iterates on it
+harness.py                  ← you implement
+embed_and_score.py          ← you implement
+eval_data/images/eval/      ← canonical 20-image eval split
+eval_data/images/val/       ← canonical 5-image validation split
+eval_data/images/train/     ← schema split, may stay empty for this harness
+eval_data/images/holdout/   ← schema split, keep private/empty here
+eval_data/images/manifest.json
+eval_images/                ← optional compatibility symlink to eval_data/images/eval
+val_images/                 ← optional compatibility symlink to eval_data/images/val
+experiments/          ← canonical schema runtime outputs
 cache/                ← auto-created at runtime, git-ignored
-runs/                 ← auto-created at runtime, git-ignored
+runs/                 ← compatibility symlink/copy to experiments/runs
 weights/              ← auto-created at runtime, git-ignored
-logbook.md            ← start empty with a single "# Logbook" header
+logbook.md            ← compatibility symlink/copy to experiments/logbook.md
 program.md            ← already exists; do not modify
 README.md             ← already exists; do not modify
 IMPLEMENTATION.md     ← this file; you can leave it in place
-AGENTS.md             ← symlink to program.md (you create)
+AGENTS.md             ← implementation context now; replace with program.md for driver handoff
 pyproject.toml        ← you create
 .env.example          ← you create
 .env                  ← human creates from .env.example; never commit
@@ -137,20 +144,44 @@ Do this top to bottom. Don't skip the smoke test in step 9.
 1. **Initialize the project.** `uv init`, replace the generated
    `pyproject.toml` with the one in section 5, run `uv sync`.
 2. **Create `.gitignore`.** Must exclude: `.env`, `weights/`,
-   `cache/`, `runs/`, `__pycache__/`, `*.pyc`, `.venv/`.
+   `cache/`, `runs/`, `experiments/runs/`, `experiments/cache/`,
+   `eval_data/images/*/*.png`, `__pycache__/`, `*.pyc`, `.venv/`.
 3. **Create `.env.example`** with `GOOGLE_GENAI_USE_VERTEXAI=true`,
    `GOOGLE_CLOUD_PROJECT=`, and `GOOGLE_CLOUD_LOCATION=global`.
 4. **Implement `embed_and_score.py`** per section 6.
 5. **Implement `harness.py`** per section 7.
 6. **Ship the baseline `prompt_strategy.py`** per section 8.
-7. **Set up image directories.** `mkdir -p eval_images val_images`.
+7. **Set up image directories.** Create
+   `eval_data/images/{train,eval,val,holdout}` and
+   `eval_data/images/manifest.json`.
    If empty, see section 9 — likely requires pausing to ask the human.
-8. **Symlink `program.md` to `AGENTS.md`:**
-   `ln -s program.md AGENTS.md`. (If on Windows or a filesystem
-   without symlinks, copy the file instead.)
+   If older commands or docs need them, create `eval_images` and `val_images`
+   as symlinks to `eval_data/images/eval` and `eval_data/images/val`.
+8. **Prepare driver agent context files.** The prepared task may start
+   with implementation-phase `AGENTS.md`, `CLAUDE.md`, and `GEMINI.md`
+   wrappers so auto-loaded context does not fight this bootstrap phase.
+   At handoff, replace those files with symlinks or copies of
+   `program.md` so driver agents receive the research-loop instructions.
 9. **Run the smoke test** in section 10.
 10. **Initial git commit:** `init: bootstrap autoresearch repo`.
 11. **Hand off** with the message in section 11.
+
+### Eval storage schema overlay
+
+`EVAL_STORAGE_SCHEMA.md` is canonical for persisted eval inputs, run
+artifacts, leader pointers, and logbook storage. This spec's older `runs/` and
+root `logbook.md` references are compatibility paths for driver ergonomics.
+Implement the canonical layout under `experiments/` and either:
+
+- symlink `runs -> experiments/runs` and `logbook.md -> experiments/logbook.md`,
+  or
+- write both paths from one shared persistence layer without allowing them to
+  diverge.
+
+Likewise, `eval_data/images/eval` and `eval_data/images/val` are the only real
+places for benchmark images. If `eval_images/` or `val_images/` exist, they
+must be symlinks to those canonical directories, not independent copies.
+`python check_eval_storage.py --root .` must pass after eval artifacts exist.
 
 ## 5. `pyproject.toml`
 
@@ -316,10 +347,13 @@ uv run harness.py --name <name> [--val] [--seeds N] [--no-judge]
 
 - `--name <name>`: short identifier for the run. Required unless
   `--val`.
-- `--val`: run on `val_images/` instead of `eval_images/`. No
-  promotion logic. Prints scores only.
-- `--seeds N`: run the full eval N times with different generation
-  seeds, report mean ± std. Default 1.
+- `--val`: run on `eval_data/images/val` instead of
+  `eval_data/images/eval`. No promotion logic. Prints scores only.
+- `--seeds N`: run generation and scoring N times per target image
+  with different generation seeds, aggregate per-image scores across
+  those repeats, and report mean ± std. Default 3. Validate `N >= 3`
+  for eval and val runs; the eval logic must never judge a target from
+  a single generated image.
 - `--no-judge`: skip the VLM-judge call (saves ~$0.05 per
   experiment). Default: judge runs.
 
@@ -329,7 +363,7 @@ For each image in the target set:
 
 1. Read original (PIL.Image).
 2. Call `prompt_strategy.image_to_prompt(image)`. Time it.
-3. Call Nano Banana 2 with the prompt:
+3. For each configured seed, call Nano Banana 2 with the prompt:
    - Model: `gemini-3.1-flash-image-preview`
    - Use Vertex AI with `location=global`
    - Derive an aspect ratio from the reference image dimensions and
@@ -337,12 +371,16 @@ For each image in the target set:
      (for example `1:1`, `4:3`, `3:4`, `16:9`, or `9:16` as
      appropriate). Do not force every generation to square unless the
      reference image is square.
-4. Save regenerated image to `runs/<name>/<image_id>.png` and the
-   prompt to `runs/<name>/<image_id>.txt`.
-5. Call `featurize` on the regenerated image. Read cached features
+4. Save each regenerated image to a deterministic per-seed path, for
+   example `runs/<name>/<image_id>/seed_<seed>.png`, and save the
+   prompt once for that image.
+5. For each generated image, call `featurize`. Read cached features
    for the original.
-6. Call `similarity(orig_feat, regen_feat)`.
-7. Call `vlm_judge(orig, regen)` unless `--no-judge`.
+6. For each generated image, call `similarity(orig_feat, regen_feat)`.
+7. Call `vlm_judge(orig, regen)` for each generated image unless
+   `--no-judge`.
+8. Aggregate the N generated/scored repeats into one per-image score
+   using the mean per metric, and retain the per-seed scores for audit.
 
 After all images:
 
@@ -364,14 +402,14 @@ After all images:
   exists).
 - Call `gate(candidate_means, leader_means)`.
 - If gate passes AND `composite_candidate > composite_leader`:
-  - Print "Candidate passes single-run gate. Running 3-seed
+  - Print "Candidate passes gate. Running multi-seed confirmation
     re-eval..."
-  - Run the full eval 3 more times with different generation seeds
-    (seeds 1, 2, 3 — fixed for reproducibility within a session).
-  - Compute the 3-seed mean per metric.
-  - Re-run `gate` against the previous leader using the 3-seed
+  - Run a confirmation eval with the configured seed count
+    (`--seeds`, default 3, minimum 3) and different generation seeds.
+  - Compute the multi-seed mean per metric.
+  - Re-run `gate` against the previous leader using the multi-seed
     means.
-  - If gate still passes AND the 3-seed mean composite still beats
+  - If gate still passes AND the multi-seed mean composite still beats
     the leader composite:
     - Copy `runs/<name>/` to `runs/leader/`.
     - Write `runs/leader/composite.json`:
@@ -380,13 +418,14 @@ After all images:
         "name": "<name>",
         "means": {...},
         "composite": 0.7421,
-        "three_seed_mean": 0.7398,
-        "three_seed_std": 0.0042,
+        "confirmation_seed_count": 3,
+        "confirmation_seed_mean": 0.7398,
+        "confirmation_seed_std": 0.0042,
         "timestamp": "..."
       }
       ```
     - Print "PROMOTED. New leader."
-  - Else: print "REVERTED. 3-seed re-eval did not hold."
+  - Else: print "REVERTED. multi-seed re-eval did not hold."
 
 ### Logbook entry
 
@@ -486,7 +525,7 @@ different specific content. If eval has a flat-vector "growth chart"
 illustration, val should have a flat-vector "team meeting"
 illustration — same archetype, different content.
 
-### If `eval_images/` is empty when you reach this step
+### If `eval_data/images/eval/` is empty when you reach this step
 
 **Stop and ask the human.** Do not scrape, generate, or auto-fill
 substitutes. The eval set is the most consequential decision in the
@@ -496,19 +535,20 @@ experiment afterward.
 A reasonable hand-off message at that point:
 
 > The harness is built and the smoke test for `embed_and_score.py`
-> passes. I need you to populate `eval_images/` with 20 reference
-> images and `val_images/` with 5 held-out images before I can run
-> the end-to-end smoke test. See IMPLEMENTATION.md section 9 for
-> the recommended distribution. Once images are in place, I'll
-> re-run the smoke test and finish handoff.
+> passes. I need you to populate `eval_data/images/eval/` with 20
+> reference images and `eval_data/images/val/` with 5 held-out images
+> before I can run the end-to-end smoke test. See IMPLEMENTATION.md
+> section 9 for the recommended distribution. Once images are in place,
+> I'll re-run the smoke test and finish handoff.
 
 ### Validation checks (run after the human populates the directories)
 
-- All files in `eval_images/` and `val_images/` load with PIL.
+- All files in `eval_data/images/eval/` and `eval_data/images/val/` load with PIL.
 - All images are at least 512×512.
 - No transparent backgrounds (will confuse generation).
-- No duplicate sha256s between `eval_images/` and `val_images/`.
+- No duplicate sha256s between `eval_data/images/eval/` and `eval_data/images/val/`.
 - File count is exactly 20 and 5.
+- `eval_data/images/manifest.json` is present and includes every eval and val image.
 
 If any check fails, stop and report.
 
@@ -535,7 +575,7 @@ If this fails, fix before proceeding. Common failure modes:
 
 ### Test 2: full harness on at least one image
 
-If the human has populated `eval_images/` with at least one image:
+If the human has populated `eval_data/images/eval/` with at least one image:
 
 ```bash
 uv run harness.py --name smoke_test --no-judge
@@ -548,7 +588,7 @@ writes `runs/smoke_test/`, and promotes itself as the first leader
 (since there's no previous leader). If this fails, fix before
 handing off.
 
-If `eval_images/` is empty, skip Test 2 and note in the handoff
+If `eval_data/images/eval/` is empty, skip Test 2 and note in the handoff
 that it could not be run.
 
 ## 11. Definition of done
@@ -558,9 +598,13 @@ Hand off only when ALL of these are true:
 - [ ] `uv sync` succeeds from a clean clone.
 - [ ] Smoke test 1 passes (`featurize` returns the four expected
       keys).
-- [ ] Smoke test 2 passes if `eval_images/` is populated
+- [ ] Smoke test 2 passes if `eval_data/images/eval/` is populated
       (full harness run completes end-to-end).
-- [ ] `program.md` is symlinked or copied to `AGENTS.md`.
+- [ ] Eval and val runs validate `--seeds >= 3` and generate, score,
+      aggregate, and persist at least three per-seed results for each
+      target image.
+- [ ] `program.md` is symlinked or copied to `AGENTS.md`, `CLAUDE.md`,
+      and `GEMINI.md` for the driver-agent handoff.
 - [ ] `README.md` is in place (it should already exist; do not
       overwrite).
 - [ ] `.env.example` exists; `.env` is in `.gitignore`.
@@ -577,10 +621,10 @@ Write a short message to the human covering:
 1. What was built (one sentence).
 2. Whether smoke test 2 was run; if not, what's blocking it.
 3. What the human should do next:
-   - If `eval_images/` is empty: populate it per section 9, then
+   - If `eval_data/images/eval/` is empty: populate it per section 9, then
      run `uv run harness.py --name baseline_check` to verify the
      baseline.
-   - If `eval_images/` was populated and smoke test 2 passed: the
+   - If `eval_data/images/eval/` was populated and smoke test 2 passed: the
      harness is ready; launch their preferred coding agent with
      the kickoff prompt from `program.md` "Session entrypoint".
 4. Any deviations you made from this spec, with brief justification.

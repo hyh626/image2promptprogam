@@ -45,8 +45,10 @@ Don't confuse the two roles.
 prompt_strategy.py    ← the ONLY file you edit
 harness.py            ← runs the eval loop. DO NOT MODIFY.
 embed_and_score.py    ← four similarity metrics + compositing. DO NOT MODIFY.
-eval_images/          ← 20 fixed reference images. DO NOT MODIFY.
-val_images/           ← 5 held-out images. DO NOT MODIFY.
+eval_data/images/eval/ ← 20 fixed reference images. DO NOT MODIFY.
+eval_data/images/val/  ← 5 held-out images. DO NOT MODIFY.
+eval_images/           ← optional compatibility symlink to eval_data/images/eval.
+val_images/            ← optional compatibility symlink to eval_data/images/val.
 cache/                ← cached features for original images
 runs/                 ← per-experiment artifacts
 weights/              ← downloaded local model weights
@@ -75,23 +77,25 @@ multiple API calls internally.
 uv run harness.py --name <short_descriptive_name>
 ```
 
-For each of the 20 images in `eval_images/`, the harness:
+For each of the 20 images in `eval_data/images/eval/`, the harness:
 
 1. Calls `image_to_prompt(image)` to get a prompt.
-2. Calls Nano Banana 2 once with that prompt.
-3. Computes four similarity signals between the original and the
-   regenerated image.
+2. Calls Nano Banana 2 with that prompt for each configured generation
+   seed, defaulting to at least three seeds per eval image.
+3. Computes four similarity signals between the original and each
+   regenerated image, then aggregates the per-seed scores.
 4. Combines them into the composite score (defined below).
 5. Decides whether to promote against the current leader.
 6. Appends a logbook entry.
 
-Per experiment: ~3–5 minutes wall clock, $0.10–$0.30 in API spend.
+Per experiment cost scales with `--seeds`; the default 3-seed run is roughly
+3x the one-seed generation cost.
 
 Other CLI flags:
 
 ```bash
-uv run harness.py --val           # run on val_images/, no promotion
-uv run harness.py --name <n> --seeds N   # run N seeds, report mean ± std
+uv run harness.py --val           # run on eval_data/images/val, no promotion
+uv run harness.py --name <n> --seeds N   # run N seeds per image, N >= 3
 ```
 
 ---
@@ -112,7 +116,8 @@ differences don't pollute the signal.
 
 ### Composite
 
-For each of the 20 eval images, compute all four similarities. Then:
+For each of the 20 eval images, compute all four similarities for each
+configured seed, average per image, then aggregate:
 
 ```
 mean_signal[m]  =  mean over 20 eval images of  s_m
@@ -134,16 +139,17 @@ If any single dimension drops by more than 0.01, the candidate is
 rejected even if `composite` improved. This defeats the most common
 failure mode: boost one signal by abandoning another.
 
-### 3-seed re-eval
+### Multi-seed re-eval
 
-When a candidate passes the gate on a single run, the harness
-automatically re-runs the full eval 3 more times with different
-generation seeds. The 3-seed mean must still pass the gate.
-Otherwise, revert.
+Every eval run generates and scores each target image with a configurable
+number of generation seeds. The default is 3, and real eval/val runs must
+reject values below 3. When a candidate passes the gate, the harness
+automatically runs a confirmation eval with the configured seed count. The
+multi-seed mean must still pass the gate. Otherwise, revert.
 
 ### Held-out validation
 
-`uv run harness.py --val` runs the full pipeline on `val_images/`
+`uv run harness.py --val` runs the full pipeline on `eval_data/images/val/`
 without promotion logic. Run this every ~10 promoted leaders. If
 `composite_eval` is climbing but `composite_val` is flat or dropping,
 you are overfitting to the eval set — back off and try something
@@ -174,8 +180,8 @@ model.
    jumped but `s_gemini` dropped, that's a signal about what your
    change actually did.
 6. **Decide** based on the harness output:
-   - Gate passes AND composite improves → harness runs the 3-seed
-     re-eval. If still passes, commit the file with message
+   - Gate passes AND composite improves → harness runs the multi-seed
+     confirmation re-eval. If still passes, commit the file with message
      `leader: <name> = <composite>`.
    - Otherwise → `git checkout prompt_strategy.py` and try something
      else.
@@ -218,8 +224,9 @@ prompts). Diversity is a goal, not a side effect.
 
 ## What NOT to do
 
-- Do not modify `harness.py`, `embed_and_score.py`, `eval_images/`, or
-  `val_images/`. These define the benchmark.
+- Do not modify `harness.py`, `embed_and_score.py`,
+  `eval_data/images/eval/`, or `eval_data/images/val/`. These define the
+  benchmark.
 - Do not change the image generator model, the embedding model, the
   local metric models, or the canonical 448×448 resolution.
   Comparability across experiments depends on these being fixed.
@@ -227,24 +234,24 @@ prompts). Diversity is a goal, not a side effect.
   eval images is cheating; held-out val will catch it.
 - Do not optimize against the VLM-judge scores. They are diagnostic
   only.
-- Do not chase a single lucky run. The 3-seed re-eval gate exists for
-  a reason.
+- Do not chase a single lucky run. The configurable multi-seed re-eval
+  gate exists for a reason, and it must use at least three seeds.
 
 ## Logbook entry format
 
 ```
-### <name> — <YYYY-MM-DD HH:MM>
+### <run_id>
 - driver: <e.g. claude-opus-4.7 via claude-code, or gpt-5 via codex>
 - hypothesis: <one sentence>
 - composite: 0.7421
 - s_gemini: 0.812 | s_dino: 0.701 | s_lpips: 0.688 | s_color: 0.767
-- gate vs leader: pass | fail (<which metric regressed by how much>)
-- 3-seed re-eval: 0.7398 ± 0.0042   (only if promoted)
+- gate: pass
+- 3-seed re-eval: 0.7398 ± 0.0042   (configured confirmation run; n/a if not run)
 - val composite: 0.7301              (only if --val was run)
 - wall_clock: 4.2 min
 - est_cost_usd: 0.18
-- takeaway: <one or two sentences>
-- promoted: yes | no
+- takeaway: <one or two sentences, including any gate-vs-leader detail>
+- promoted: yes | no | reverted
 ```
 
 The `driver` field is important: it lets future readers (or
@@ -292,8 +299,10 @@ Symlink `program.md` to whatever filename your agent auto-loads:
 | Aider | none auto-loaded | pass `--read program.md` on launch |
 | Cursor | `.cursorrules` | `ln -s program.md .cursorrules` |
 
-`AGENTS.md` is shipped pre-symlinked, which covers Codex, OpenCode,
-and several other agents that follow the AGENTS.md convention.
+Prepared implementation folders may initially ship implementation-phase
+context wrappers in these files. After the harness is built, replace those
+wrappers with symlinks or copies of `program.md` before starting the
+research/driver agent.
 
 ### Sandboxing & permissions
 

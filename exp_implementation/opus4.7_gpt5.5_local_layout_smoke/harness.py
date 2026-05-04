@@ -209,14 +209,14 @@ def validate_inputs(split: str) -> list[TargetImage]:
     val_entries = manifest["splits"]["val"]
     if not eval_entries:
         errors.append(
-            "eval_images/ is empty; populate it with 20 reference images before running the harness"
+            "eval_data/images/eval/ is empty; populate it with 20 reference images before running the harness"
         )
     if eval_entries and len(eval_entries) != EXPECTED_COUNTS["eval"]:
-        errors.append(f"eval_images/ must contain exactly 20 images, found {len(eval_entries)}")
+        errors.append(f"eval_data/images/eval/ must contain exactly 20 images, found {len(eval_entries)}")
     if val_entries and len(val_entries) != EXPECTED_COUNTS["val"]:
-        errors.append(f"val_images/ must contain exactly 5 images, found {len(val_entries)}")
+        errors.append(f"eval_data/images/val/ must contain exactly 5 images, found {len(val_entries)}")
     if eval_entries and not val_entries:
-        errors.append("val_images/ is empty; populate it with 5 held-out images before running the harness")
+        errors.append("eval_data/images/val/ is empty; populate it with 5 held-out images before running the harness")
 
     eval_hashes = {e["sha256"]: e["image_id"] for e in eval_entries}
     for entry in val_entries:
@@ -805,7 +805,7 @@ def run_harness(args: argparse.Namespace, cli_args: list[str]) -> int:
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--name", help="short identifier for the run")
-    parser.add_argument("--val", action="store_true", help="run on val_images/ without promotion")
+    parser.add_argument("--val", action="store_true", help="run on eval_data/images/val/ without promotion")
     parser.add_argument("--seeds", type=int, default=3, help="generation seeds per target image")
     parser.add_argument("--no-judge", action="store_true", help="skip diagnostic VLM judge")
     return parser.parse_args(argv)
