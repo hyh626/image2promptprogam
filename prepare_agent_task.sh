@@ -293,8 +293,6 @@ into prepared task folders.
 
 Compatibility shortcuts may also exist, depending on the selected spec:
 
-- eval_images -> eval_data/images/eval
-- val_images -> eval_data/images/val
 - target_image.png copied from the first image in eval_data/images/eval for single-target specs
 EOF
 }
@@ -501,12 +499,6 @@ else
 fi
 
 generate_eval_manifest "$EVAL_IMAGE_ROOT"
-
-if docs_mention "eval_images/|val_images/"; then
-  info "Creating opus-style image directory symlinks"
-  link_dir_if_missing "eval_data/images/eval" "$TARGET_DIR/eval_images"
-  link_dir_if_missing "eval_data/images/val" "$TARGET_DIR/val_images"
-fi
 
 if docs_mention "data/targets"; then
   info "Creating data/targets compatibility symlinks"

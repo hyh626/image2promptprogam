@@ -143,7 +143,7 @@ dir; permission to run `git` and `uv`.
 
 Self-contained. Assumes the harness already exists. The driver only edits
 `prompt_strategy.py` and reads scores; it does NOT modify
-`harness.py` / `embed_and_score.py` / `eval_images/` / `val_images/`.
+`harness.py` / `embed_and_score.py` / `eval_data/images/eval/` / `eval_data/images/val/`.
 
 Sections to include:
 - Brief intro stating the harness is already built; driver does not modify it
@@ -195,10 +195,10 @@ Sections to include:
   - Append logbook entry with `<TODO>` placeholders for hypothesis/takeaway, OR fill from env vars `AUTORESEARCH_HYPOTHESIS` / `AUTORESEARCH_DRIVER` if set
   - Output discipline: greppable lines `composite=...`, `gate=...`, `promoted=...`
 - Baseline `prompt_strategy.py` — verbatim code to ship: single VLM call with `"Describe this image so it can be regenerated."` as the only instruction. Deliberately mediocre.
-- Eval/val image guidance (the 20+5 slide-image distribution above), and the explicit instruction: **if `eval_images/` is empty, stop and ask the human — do NOT scrape, generate, or auto-fill substitutes**. Provide a sample handoff message for that case. Validation checks once populated: PIL load, ≥512×512, no transparency, no sha256 duplicates between sets, exact counts (20 and 5).
+- Eval/val image guidance (the 20+5 slide-image distribution above), and the explicit instruction: **if `eval_data/images/eval/` is empty, stop and ask the human — do NOT scrape, generate, or auto-fill substitutes**. Provide a sample handoff message for that case. Validation checks once populated: PIL load, ≥512×512, no transparency, no sha256 duplicates between sets, exact counts (20 and 5).
 - Two-stage smoke test:
   - Test 1: `featurize` on a blank 448×448 red image → expect the four expected keys
-  - Test 2 (if eval_images populated): full harness with `--no-judge` → must complete and self-promote as first leader
+  - Test 2 (if eval_data/images/eval populated): full harness with `--no-judge` → must complete and self-promote as first leader
 - Definition of done (checklist of ~9 items)
 - Handoff message format (what was built, smoke test status, next action for human, any deviations)
 - Notes for the implementation agent: don't run experiments, don't modify `program.md`, don't over-engineer (~500 lines target across both files), don't assume CUDA

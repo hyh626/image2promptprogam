@@ -47,8 +47,6 @@ harness.py            ← runs the eval loop. DO NOT MODIFY.
 embed_and_score.py    ← four similarity metrics + compositing. DO NOT MODIFY.
 eval_data/images/eval/ ← 20 fixed reference images. DO NOT MODIFY.
 eval_data/images/val/  ← 5 held-out images. DO NOT MODIFY.
-eval_images/           ← optional compatibility symlink to eval_data/images/eval.
-val_images/            ← optional compatibility symlink to eval_data/images/val.
 cache/                ← cached features for original images
 runs/                 ← per-experiment artifacts
 weights/              ← downloaded local model weights
