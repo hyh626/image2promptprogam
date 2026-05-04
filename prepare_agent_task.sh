@@ -284,7 +284,7 @@ Data copy status: $data_status
 
 Canonical image splits:
 
-- eval_data/images/eval: 20-image evaluation split, copied from ${DATA_URI%/}/train when data copy is enabled
+- eval_data/images/eval: 30-image evaluation split, copied from ${DATA_URI%/}/train when data copy is enabled
 - eval_data/images/val: 5-image validation split, copied from ${DATA_URI%/}/eval when data copy is enabled
 
 The schema also defines eval_data/images/train and eval_data/images/holdout.

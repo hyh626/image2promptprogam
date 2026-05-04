@@ -267,7 +267,7 @@ possible.
   "schema_version": "1.0.0",
   "run_id": "20260504T123456Z__claude-opus-4-7__add_palette_step",
   "split": "eval",
-  "n_images": 20,
+  "n_images": 30,
   "seeds": [0],
   "means": {
     "s_gemini": 0.789,

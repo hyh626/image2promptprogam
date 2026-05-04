@@ -115,7 +115,7 @@ per experiment.
 prompt_strategy.py          ← baseline you ship; driver iterates on it
 harness.py                  ← you implement
 embed_and_score.py          ← you implement
-eval_data/images/eval/      ← canonical 20-image eval split
+eval_data/images/eval/      ← canonical 30-image eval split
 eval_data/images/val/       ← canonical 5-image validation split
 eval_data/images/train/     ← schema split, may stay empty for this harness
 eval_data/images/holdout/   ← schema split, keep private/empty here
@@ -490,7 +490,7 @@ should be straightforward for the driver.
 
 ## 9. Eval and validation images
 
-The eval set is **20 images**, the val set is **5 images**. Once
+The eval set is **30 images**, the val set is **5 images**. Once
 locked, neither is modified — every experiment is comparable only
 because the benchmark is fixed.
 
@@ -542,7 +542,7 @@ A reasonable hand-off message at that point:
 - All images are at least 512×512.
 - No transparent backgrounds (will confuse generation).
 - No duplicate sha256s between `eval_data/images/eval/` and `eval_data/images/val/`.
-- File count is exactly 20 and 5.
+- File count is exactly 30 and 5.
 - `eval_data/images/manifest.json` is present and includes every eval and val image.
 
 If any check fails, stop and report.
