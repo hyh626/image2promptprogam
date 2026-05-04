@@ -1,0 +1,30 @@
+Read IMPLEMENTATION.md first, then read program.md for the intended research
+workflow.
+
+Build the prompt-only image reproduction autoresearch harness described in
+this folder. The goal is a configurable Python project that can run
+single-image and benchmark prompt-search experiments over the visible
+train/eval data in the prepared task folder. Do not access or assume any
+holdout data.
+
+Important constraints:
+
+- Keep provider/model choices configurable instead of hardcoding Gemini model
+  IDs into core logic.
+- Implement clear separation between config, provider clients, scoring,
+  search, logging, image utilities, and CLI entrypoints.
+- Cache expensive embeddings by content hash where the spec calls for it.
+- Save complete run artifacts under outputs/runs/.
+- Add focused tests for schema/config validation, scoring behavior, search
+  bookkeeping, and logging.
+
+Start with the smallest end-to-end path that can process one target image,
+then extend to benchmark runs once the interfaces are stable.
+
+When you are done, run the relevant unit tests and the smallest available
+smoke test if API keys, dependencies, and data are available. If external
+credentials or downloads are missing, report the blocked commands and the
+expected next command after they are provided.
+
+Finish with a concise handoff that explains how to configure and run the first
+single-image experiment.

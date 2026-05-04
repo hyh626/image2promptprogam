@@ -1,0 +1,24 @@
+Read IMPLEMENTATION.md first, then read program.md for the user-facing
+research contract.
+
+Build the autoresearch harness described in this folder. Treat program.md as
+the fixed benchmark contract and IMPLEMENTATION.md as the implementation plan.
+Use the visible images already present in the prepared task folder; do not try
+to fetch or infer any holdout data.
+
+Important constraints:
+
+- Implement the harness files and baseline strategy described by
+  IMPLEMENTATION.md.
+- Do not run the autoresearch optimization loop as the implementation agent.
+- Do not edit benchmark image directories except for normal read-only use.
+- Do not change the fixed model roles, scoring contract, or promotion gate.
+- Keep the implementation usable by generic coding agents through the shipped
+  context files.
+
+When you are done, run the required smoke tests from IMPLEMENTATION.md if API
+keys, dependencies, and data are available. If a required external credential
+or download is missing, stop cleanly and report exactly what remains blocked.
+
+Finish with a concise handoff that lists what you built, what tests passed or
+could not run, and the exact command a research/driver agent should run next.

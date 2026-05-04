@@ -1,0 +1,27 @@
+Read IMPLEMENTATION.md first, then read program.md for the Vision-Ratchet
+workflow.
+
+Build the simple Vision-Ratchet harness described in this folder. The target
+shape is a direct implementation centered on main.py, prompt.txt,
+target_image.png, workspace/, and history.log. Use the visible task-folder
+data for development only; do not fetch or use holdout data.
+
+Important constraints:
+
+- Implement the keep-or-revert ratchet loop exactly enough to be runnable from
+  the command line.
+- Use patch-based image embedding similarity as the primary score, comparing
+  corresponding image regions rather than only whole-image semantics.
+- Keep prompt.txt as the current best prompt and revert it on failed
+  iterations.
+- Log every iteration to history.log with score, prompt, and kept/reverted
+  action.
+- Add argparse support for --iterations and --target.
+- Halt clearly if the target image or required API configuration is missing.
+
+When you are done, run a minimal smoke test if credentials, dependencies, and
+a target image are available. If an external dependency is unavailable, report
+the exact missing piece and the command to rerun after it is supplied.
+
+Finish with a concise handoff that includes the command for a user to start a
+Vision-Ratchet run.

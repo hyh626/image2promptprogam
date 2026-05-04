@@ -18,6 +18,7 @@ public train/eval data into a standalone folder for a test agent.
 opus4.7/
   program.md              # Instructions for the research/driver agent
   IMPLEMENTATION.md       # Instructions for the implementation agent
+  kickoff-prompt.txt      # Prompt to paste into a coding agent
   single-repro-prompt.txt # Source prompt notes; not copied into task folders
 
 gpt5.5/
@@ -59,6 +60,7 @@ That creates a standalone folder containing:
 
 - `program.md`
 - `IMPLEMENTATION.md`
+- `kickoff-prompt.txt`
 - copied agent context files: `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`
 - `data/train`
 - `data/eval`
@@ -119,7 +121,7 @@ keeps edits made by a test agent contained inside the prepared folder.
    ```
 
 3. Open the target folder in the coding agent you want to evaluate.
-4. Ask the agent to read `IMPLEMENTATION.md` and build the harness.
+4. Paste `kickoff-prompt.txt` into the agent to start the implementation run.
 5. After implementation, use the visible eval data for smoke tests and
    development checks.
 6. Evaluate final generalization separately with holdout data outside the task
