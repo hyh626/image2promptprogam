@@ -469,3 +469,10 @@ A good result is not merely one impressive example. A good result shows:
 - robust final prompts across seeds,
 - category-level insights,
 - reusable prompt-construction rules.
+
+## Kickoff Prompt
+
+Paste the contents of
+[`autoresearch-kickoff-prompt.txt`](autoresearch-kickoff-prompt.txt)
+as the first message to the driver agent (works across Claude Code,
+Codex CLI, Gemini CLI, Aider, Cursor, etc.).

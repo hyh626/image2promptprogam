@@ -308,17 +308,9 @@ Whitelist these explicitly when launching the agent if it asks.
 
 ### Session entrypoint
 
-Same regardless of which CLI:
-
-```
-> Read program.md and the latest entries in logbook.md.
-> Then start a new session — aim for at least 20 experiments,
-> prioritizing qualitatively different strategies over local
-> optimization. Re-read logbook.md before each new hypothesis.
-> Record your driver model in each logbook entry.
-```
-
-Paste that as your first message.
+Same regardless of which CLI: paste the contents of
+[`autoresearch-kickoff-prompt.txt`](autoresearch-kickoff-prompt.txt)
+as your first message to the driver agent.
 
 ### Cross-agent meta-experiment (optional)
 

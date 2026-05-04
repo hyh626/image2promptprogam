@@ -1,25 +1,27 @@
-Read program.md first. Skim IMPLEMENTATION.md only for repo-specific
-constraints; do not rebuild the harness unless program.md explicitly tells you
-to.
+Read program.md. You are running the Vision-Ratchet loop. The
+harness (main.py) is already built — do not modify it, the
+patch-based scoring (2x2 grid, mean cosine similarity), the
+target_image.png, or the model identifiers. Your only editable
+surface between runs is prompt.txt; during a run the harness
+manages prompt.txt itself via the ratchet (keep on improvement,
+revert on regression).
 
-You are now the autoresearch driver. Use the harness already present in this
-folder and follow program.md as the source of truth. Use only the visible data
-included in this task folder; do not fetch, infer, or use holdout data.
+Pre-run checklist: confirm target_image.png exists in the working
+directory, confirm prompt.txt holds a foundational zero-shot
+prompt (one or two sentences describing the subject, style, and
+lighting), and confirm GEMINI API credentials are reachable.
 
-Before each experiment, read the existing logbook or run history if one exists,
-then write one concise hypothesis. Modify only the research surface allowed by
-this folder's docs. Do not change harness code, scoring logic, benchmark data,
-or fixed model/generation settings unless the docs explicitly define that as
-part of the experiment.
+Start the loop with `python main.py --iterations 100`. The
+harness will: read prompt.txt, generate an image, compute
+patch-based similarity against target_image.png, decide
+keep-or-revert, then ask the inner VLM to identify ONE specific
+visual discrepancy and rewrite the prompt to fix it. Repeat for
+the requested iteration count.
 
-Run the experiment command described by program.md, inspect the metric
-breakdown and saved artifacts, and keep, promote, or revert changes according
-to the repo's rules. Log every experiment with enough detail for the next agent
-to understand what was tried and what happened.
-
-Prefer qualitatively different experiments over tiny local tweaks. If a run is
-blocked by missing API keys, dependencies, data, or permissions, stop cleanly
-and report the exact blocker and the command to rerun after it is fixed.
-
-Finish the session with a concise summary of the best result, what worked,
-what failed or regressed, and the next experiments worth trying.
+When the run finishes, inspect history.log for the score
+trajectory and the kept/reverted ratio. Report: starting score,
+best score, final prompt.txt, the iteration where the largest
+jump occurred, and whether the loop plateaued. Then propose ONE
+concrete next action — extend iterations, restart from a stronger
+baseline prompt, or swap target_image.png for a different
+reproduction stress test.
