@@ -29,7 +29,54 @@ gemini3.1pro/
 prepare_agent_task.sh     # Creates a standalone task folder
 EVAL_STORAGE_SCHEMA.md    # Canonical eval output storage schema
 check_eval_storage.py     # Conformance checker for built task repos
+view_eval_results.py      # Local web viewer for experiment results
+sync_runs_to_gcs.py       # Mirror experiment results to GCS
 prompts                   # Conversation notes used to create the specs
+```
+
+## Browsing Experiment Results
+
+`view_eval_results.py` is a stdlib-only web server that browses experiment
+output produced under the schema in `EVAL_STORAGE_SCHEMA.md`. Point it at any
+local directory or a `gs://` URI; it auto-detects "this folder contains runs"
+and switches between three views.
+
+```bash
+python view_eval_results.py --root ./exp_implementation/opus4.7_gpt5.5_baseline
+python view_eval_results.py --root gs://image2promptdata/experiments
+```
+
+### Folder browser
+
+The sidebar shows whatever subfolders exist under the current path; folders
+that contain runs get an `experiments` badge, individual run dirs get a `run`
+badge.
+
+![folder browser](docs/screenshots/01-browser.png)
+
+### Summary table
+
+Entering a folder that contains runs renders a sortable summary: composite
+score, every per-metric mean, gate result, and the gate's promotion decision
+as a coloured pill.
+
+![summary table](docs/screenshots/02-summary.png)
+
+### Run detail
+
+Clicking a row shows the run's metadata, hypothesis, takeaway, and a
+per-image grid with target vs. generated side-by-side plus the recorded
+metric scores. (Demo fixture uses solid colour blocks; real runs show actual
+images.)
+
+![run detail](docs/screenshots/03-run-detail.png)
+
+The screenshots above were generated against the demo fixture from
+`scripts/build_demo_fixture.py`. To reproduce:
+
+```bash
+python scripts/build_demo_fixture.py --out /tmp/demo-fixture
+python view_eval_results.py --root /tmp/demo-fixture
 ```
 
 ## Data
