@@ -5,11 +5,15 @@ Browse a directory tree, see a summary table when entering a folder that
 contains experiment runs (per EVAL_STORAGE_SCHEMA.md), and click a run to
 visualize its per-image targets, generations, prompts, and scores.
 
-Usage:
-    python view_eval_results.py --root <path> [--port 8765] [--host 127.0.0.1]
-    python view_eval_results.py --root . --open
+Roots can be local paths or GCS URIs:
 
-Stdlib-only. Bind to 127.0.0.1 by default.
+    python view_eval_results.py --root /local/repo
+    python view_eval_results.py --root gs://image2promptdata/experiments
+
+GCS reads stream through the google-cloud-storage SDK; nothing is copied
+to local disk. Authentication uses Application Default Credentials
+(`gcloud auth application-default login` or
+GOOGLE_APPLICATION_CREDENTIALS).
 """
 from __future__ import annotations
 
@@ -20,71 +24,300 @@ import mimetypes
 import socketserver
 import sys
 import threading
+import time
 import urllib.parse
 import webbrowser
 from pathlib import Path
-from typing import Any
+from threading import RLock
+from typing import Any, Iterator
 
-ROOT: Path = Path()
-
-
-# --------------------------- path safety ---------------------------
+# --------------------------- backend abstraction ---------------------------
 
 
-def resolve_safe(rel: str) -> Path:
-    cleaned = (rel or "").lstrip("/").replace("\\", "/")
-    target = (ROOT / cleaned).resolve() if cleaned else ROOT
-    if target != ROOT and ROOT not in target.parents:
-        raise PermissionError(f"path escapes root: {rel!r}")
-    return target
+class Backend:
+    """Read-only storage backend. Paths are forward-slash strings relative to root."""
+
+    root_label: str = ""
+
+    def list_dir(self, rel: str) -> tuple[list[dict], list[dict]]:
+        raise NotImplementedError
+
+    def is_file(self, rel: str) -> bool:
+        raise NotImplementedError
+
+    def is_dir(self, rel: str) -> bool:
+        raise NotImplementedError
+
+    def exists(self, rel: str) -> bool:
+        return self.is_file(rel) or self.is_dir(rel)
+
+    def read_text(self, rel: str) -> str:
+        raise NotImplementedError
+
+    def file_size(self, rel: str) -> int:
+        raise NotImplementedError
+
+    def stream(self, rel: str) -> Iterator[bytes]:
+        raise NotImplementedError
+
+    def content_type(self, rel: str) -> str:
+        return mimetypes.guess_type(rel)[0] or "application/octet-stream"
 
 
-def rel_path(p: Path) -> str:
-    try:
-        rel = p.resolve().relative_to(ROOT)
-    except ValueError:
+def _clean_rel(rel: str) -> str:
+    """Reject path traversal and normalize to forward slashes."""
+    cleaned = (rel or "").replace("\\", "/").strip("/")
+    if not cleaned:
         return ""
-    s = str(rel)
-    return "" if s == "." else s
+    parts = cleaned.split("/")
+    if any(p in ("", ".", "..") for p in parts):
+        raise PermissionError(f"path escapes root or contains dotted segments: {rel!r}")
+    return "/".join(parts)
 
 
-# --------------------------- classification ---------------------------
+class LocalBackend(Backend):
+    def __init__(self, root: Path) -> None:
+        self._root = root.resolve()
+        if not self._root.is_dir():
+            raise FileNotFoundError(f"{self._root} is not a directory")
+        self.root_label = self._root.name or str(self._root)
 
+    def _abs(self, rel: str) -> Path:
+        return self._root / rel if rel else self._root
 
-def classify_dir(p: Path) -> str:
-    if (p / "run.json").is_file():
-        return "run"
-    if p.is_dir():
+    def list_dir(self, rel: str) -> tuple[list[dict], list[dict]]:
+        target = self._abs(rel)
+        subdirs: list[dict] = []
+        files: list[dict] = []
+        if not target.is_dir():
+            return subdirs, files
         try:
-            for child in p.iterdir():
-                if child.is_dir() and (child / "run.json").is_file():
-                    return "runs_container"
+            children = sorted(target.iterdir(), key=lambda c: (not c.is_dir(), c.name.lower()))
         except PermissionError:
-            pass
+            return subdirs, files
+        for child in children:
+            if child.name.startswith("."):
+                continue
+            child_rel = f"{rel}/{child.name}" if rel else child.name
+            if child.is_dir():
+                subdirs.append({"name": child.name, "path": child_rel})
+            else:
+                try:
+                    size = child.stat().st_size
+                except OSError:
+                    size = 0
+                files.append({"name": child.name, "path": child_rel, "size": size})
+        return subdirs, files
+
+    def is_file(self, rel: str) -> bool:
+        return self._abs(rel).is_file()
+
+    def is_dir(self, rel: str) -> bool:
+        return self._abs(rel).is_dir()
+
+    def read_text(self, rel: str) -> str:
+        return self._abs(rel).read_text(encoding="utf-8")
+
+    def file_size(self, rel: str) -> int:
+        return self._abs(rel).stat().st_size
+
+    def stream(self, rel: str) -> Iterator[bytes]:
+        with self._abs(rel).open("rb") as f:
+            while True:
+                chunk = f.read(64 * 1024)
+                if not chunk:
+                    break
+                yield chunk
+
+
+class GCSBackend(Backend):
+    """Direct read-through GCS backend, with a small TTL cache for metadata calls."""
+
+    def __init__(self, bucket: str, prefix: str, cache_ttl: float = 30.0) -> None:
+        try:
+            from google.cloud import storage  # type: ignore[import-not-found]
+        except ImportError as exc:
+            raise ImportError(
+                "google-cloud-storage is required for gs:// roots. "
+                "Install with `pip install google-cloud-storage`."
+            ) from exc
+        self._storage = storage
+        self._client = storage.Client()
+        self._bucket = self._client.bucket(bucket)
+        self._prefix = prefix.strip("/")
+        self._cache: dict[tuple[str, str], tuple[float, Any]] = {}
+        self._lock = RLock()
+        self._ttl = cache_ttl
+        self.root_label = f"gs://{bucket}" + (f"/{self._prefix}" if self._prefix else "")
+
+    def _full(self, rel: str) -> str:
+        rel = rel.strip("/")
+        if self._prefix and rel:
+            return f"{self._prefix}/{rel}"
+        return self._prefix or rel
+
+    def _cache_get(self, key: tuple[str, str]) -> Any:
+        with self._lock:
+            v = self._cache.get(key)
+            if v is None:
+                return None
+            ts, val = v
+            if time.time() - ts > self._ttl:
+                self._cache.pop(key, None)
+                return None
+            return val
+
+    def _cache_set(self, key: tuple[str, str], val: Any) -> None:
+        with self._lock:
+            self._cache[key] = (time.time(), val)
+
+    def list_dir(self, rel: str) -> tuple[list[dict], list[dict]]:
+        key = ("list", rel)
+        cached = self._cache_get(key)
+        if cached is not None:
+            return cached
+
+        full = self._full(rel)
+        list_prefix = (full + "/") if full else ""
+        iterator = self._client.list_blobs(self._bucket, prefix=list_prefix, delimiter="/")
+        # Exhausting blobs is required before iterator.prefixes is populated.
+        blobs = list(iterator)
+        prefixes = list(iterator.prefixes)
+
+        subdirs: list[dict] = []
+        for p in sorted(prefixes):
+            name = p[len(list_prefix):].rstrip("/")
+            if not name or name.startswith("."):
+                continue
+            sub_rel = f"{rel}/{name}" if rel else name
+            subdirs.append({"name": name, "path": sub_rel})
+            self._cache_set(("isdir", sub_rel), True)
+
+        files: list[dict] = []
+        for b in blobs:
+            name = b.name[len(list_prefix):]
+            # Skip directory placeholder objects ("foo/") and dotfiles.
+            if not name or name.endswith("/") or name.startswith("."):
+                continue
+            if "/" in name:
+                continue
+            file_rel = f"{rel}/{name}" if rel else name
+            size = b.size or 0
+            files.append({"name": name, "path": file_rel, "size": size})
+            self._cache_set(("isfile", file_rel), True)
+            self._cache_set(("size", file_rel), size)
+
+        result = (subdirs, files)
+        self._cache_set(key, result)
+        return result
+
+    def is_file(self, rel: str) -> bool:
+        key = ("isfile", rel)
+        cached = self._cache_get(key)
+        if cached is not None:
+            return cached
+        if not rel:
+            self._cache_set(key, False)
+            return False
+        blob = self._bucket.blob(self._full(rel))
+        exists = blob.exists(self._client)
+        self._cache_set(key, exists)
+        return exists
+
+    def is_dir(self, rel: str) -> bool:
+        key = ("isdir", rel)
+        cached = self._cache_get(key)
+        if cached is not None:
+            return cached
+        full = self._full(rel)
+        list_prefix = (full + "/") if full else ""
+        # Cheap probe: does any blob exist under this prefix?
+        probe = self._client.list_blobs(self._bucket, prefix=list_prefix, max_results=1)
+        result = any(True for _ in probe)
+        if not result and not rel:
+            result = True  # root always exists
+        self._cache_set(key, result)
+        return result
+
+    def read_text(self, rel: str) -> str:
+        blob = self._bucket.blob(self._full(rel))
+        return blob.download_as_text()
+
+    def file_size(self, rel: str) -> int:
+        key = ("size", rel)
+        cached = self._cache_get(key)
+        if cached is not None:
+            return cached
+        blob = self._bucket.blob(self._full(rel))
+        blob.reload(client=self._client)
+        size = blob.size or 0
+        self._cache_set(key, size)
+        return size
+
+    def stream(self, rel: str) -> Iterator[bytes]:
+        blob = self._bucket.blob(self._full(rel))
+        with blob.open("rb") as f:
+            while True:
+                chunk = f.read(64 * 1024)
+                if not chunk:
+                    break
+                yield chunk
+
+
+BACKEND: Backend  # set in main()
+
+
+# --------------------------- view builders ---------------------------
+
+
+def safe_load_json(rel: str) -> Any:
+    if not BACKEND.is_file(rel):
+        return None
+    try:
+        return json.loads(BACKEND.read_text(rel))
+    except Exception:
+        return None
+
+
+def classify_dir(rel: str) -> str:
+    if BACKEND.is_file(f"{rel}/run.json" if rel else "run.json"):
+        return "run"
+    if BACKEND.is_dir(rel):
+        subdirs, _ = BACKEND.list_dir(rel)
+        for s in subdirs:
+            child_run_json = f"{s['path']}/run.json"
+            if BACKEND.is_file(child_run_json):
+                return "runs_container"
     return "dir"
 
 
-def find_manifest(start: Path) -> Path | None:
-    cur = start.resolve()
+def parent_of(rel: str) -> str:
+    if not rel or "/" not in rel:
+        return ""
+    return rel.rsplit("/", 1)[0]
+
+
+def find_manifest(start_rel: str) -> str | None:
+    cur = start_rel
     while True:
-        candidate = cur / "eval_data" / "images" / "manifest.json"
-        if candidate.is_file():
+        candidate = f"{cur}/eval_data/images/manifest.json" if cur else "eval_data/images/manifest.json"
+        if BACKEND.is_file(candidate):
             return candidate
-        if cur == ROOT or cur == cur.parent:
+        if not cur:
             return None
-        cur = cur.parent
+        cur = parent_of(cur)
 
 
-def load_manifest_for(start: Path) -> dict[str, dict[str, Any]]:
-    mp = find_manifest(start)
+def load_manifest_for(start_rel: str) -> dict[str, dict[str, Any]]:
+    mp = find_manifest(start_rel)
     if not mp:
         return {}
     try:
-        data = json.loads(mp.read_text(encoding="utf-8"))
+        data = json.loads(BACKEND.read_text(mp))
     except Exception:
         return {}
     out: dict[str, dict[str, Any]] = {}
-    manifest_dir_rel = rel_path(mp.parent)
+    manifest_dir_rel = parent_of(mp)
     for split_name, entries in (data.get("splits") or {}).items():
         for entry in entries or []:
             if isinstance(entry, dict) and "image_id" in entry:
@@ -95,22 +328,9 @@ def load_manifest_for(start: Path) -> dict[str, dict[str, Any]]:
     return out
 
 
-def safe_load_json(path: Path) -> Any:
-    if not path.is_file():
-        return None
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return None
-
-
-# --------------------------- view builders ---------------------------
-
-
-def breadcrumb(p: Path) -> list[dict[str, str]]:
-    rel = rel_path(p)
+def breadcrumb(rel: str) -> list[dict[str, str]]:
     parts = [] if not rel else rel.split("/")
-    out = [{"name": ROOT.name or "/", "path": ""}]
+    out = [{"name": BACKEND.root_label or "/", "path": ""}]
     accum = ""
     for part in parts:
         accum = f"{accum}/{part}" if accum else part
@@ -118,46 +338,19 @@ def breadcrumb(p: Path) -> list[dict[str, str]]:
     return out
 
 
-def list_subdirs(p: Path) -> tuple[list[dict], list[dict]]:
-    subdirs: list[dict] = []
-    files: list[dict] = []
-    if not p.is_dir():
-        return subdirs, files
-    try:
-        children = sorted(p.iterdir(), key=lambda c: (not c.is_dir(), c.name.lower()))
-    except PermissionError:
-        return subdirs, files
-    for child in children:
-        if child.name.startswith("."):
-            continue
-        entry = {"name": child.name, "path": rel_path(child)}
-        if child.is_dir():
-            entry["kind"] = classify_dir(child)
-            subdirs.append(entry)
-        else:
-            try:
-                entry["size"] = child.stat().st_size
-            except OSError:
-                entry["size"] = 0
-            files.append(entry)
-    return subdirs, files
-
-
-def build_summary(container: Path) -> list[dict[str, Any]]:
+def build_summary(container_rel: str) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    try:
-        children = sorted(container.iterdir())
-    except PermissionError:
-        return rows
-    for child in children:
-        if not (child.is_dir() and (child / "run.json").is_file()):
+    subdirs, _ = BACKEND.list_dir(container_rel)
+    for child in subdirs:
+        run_json_path = f"{child['path']}/run.json"
+        if not BACKEND.is_file(run_json_path):
             continue
-        run = safe_load_json(child / "run.json") or {}
-        agg = safe_load_json(child / "aggregate.json") or {}
-        gate = safe_load_json(child / "gate.json") or {}
+        run = safe_load_json(run_json_path) or {}
+        agg = safe_load_json(f"{child['path']}/aggregate.json") or {}
+        gate = safe_load_json(f"{child['path']}/gate.json") or {}
         rows.append({
-            "run_id": child.name,
-            "path": rel_path(child),
+            "run_id": child["name"],
+            "path": child["path"],
             "driver": run.get("driver"),
             "name": run.get("name"),
             "status": run.get("status"),
@@ -181,22 +374,22 @@ def build_summary(container: Path) -> list[dict[str, Any]]:
     return rows
 
 
-def build_run_detail(run_dir: Path) -> dict[str, Any]:
-    run = safe_load_json(run_dir / "run.json") or {}
-    agg = safe_load_json(run_dir / "aggregate.json") or {}
-    gate = safe_load_json(run_dir / "gate.json") or {}
-    cfg = safe_load_json(run_dir / "config.json") or {}
-    manifest = load_manifest_for(run_dir)
+def build_run_detail(run_rel: str) -> dict[str, Any]:
+    run = safe_load_json(f"{run_rel}/run.json") or {}
+    agg = safe_load_json(f"{run_rel}/aggregate.json") or {}
+    gate = safe_load_json(f"{run_rel}/gate.json") or {}
+    cfg = safe_load_json(f"{run_rel}/config.json") or {}
+    manifest = load_manifest_for(run_rel)
 
     images: list[dict[str, Any]] = []
     for image_id in run.get("image_ids") or []:
-        img_dir = run_dir / "per_image" / image_id
-        scores_doc = safe_load_json(img_dir / "scores.json") or {}
-        prompt_path = img_dir / "prompt.txt"
+        img_dir = f"{run_rel}/per_image/{image_id}"
+        scores_doc = safe_load_json(f"{img_dir}/scores.json") or {}
         prompt_text = ""
-        if prompt_path.is_file():
+        prompt_path = f"{img_dir}/prompt.txt"
+        if BACKEND.is_file(prompt_path):
             try:
-                prompt_text = prompt_path.read_text(encoding="utf-8")
+                prompt_text = BACKEND.read_text(prompt_path)
             except Exception:
                 prompt_text = ""
 
@@ -210,24 +403,25 @@ def build_run_detail(run_dir: Path) -> dict[str, Any]:
                 target_rel = f"{mdir}/{split}/{filename}" if mdir else f"{split}/{filename}"
                 target_url = "/api/file?path=" + urllib.parse.quote(target_rel)
 
-        gen_path = img_dir / "generated.png"
+        gen_path = f"{img_dir}/generated.png"
         gen_url = None
-        if gen_path.is_file():
-            gen_url = "/api/file?path=" + urllib.parse.quote(rel_path(gen_path))
+        if BACKEND.is_file(gen_path):
+            gen_url = "/api/file?path=" + urllib.parse.quote(gen_path)
 
         seed_entries: list[dict[str, Any]] = []
-        seeds_dir = img_dir / "seeds"
-        if seeds_dir.is_dir():
-            for seed_dir in sorted(seeds_dir.iterdir()):
-                if not seed_dir.is_dir():
-                    continue
-                seed_scores = safe_load_json(seed_dir / "scores.json") or {}
-                seed_gen = seed_dir / "generated.png"
-                seed_url = None
-                if seed_gen.is_file():
-                    seed_url = "/api/file?path=" + urllib.parse.quote(rel_path(seed_gen))
+        seeds_dir = f"{img_dir}/seeds"
+        if BACKEND.is_dir(seeds_dir):
+            seed_subs, _ = BACKEND.list_dir(seeds_dir)
+            for sub in seed_subs:
+                seed_scores = safe_load_json(f"{sub['path']}/scores.json") or {}
+                seed_gen = f"{sub['path']}/generated.png"
+                seed_url = (
+                    "/api/file?path=" + urllib.parse.quote(seed_gen)
+                    if BACKEND.is_file(seed_gen)
+                    else None
+                )
                 seed_entries.append({
-                    "seed": seed_dir.name,
+                    "seed": sub["name"],
                     "scores": seed_scores.get("scores") or {},
                     "generated_url": seed_url,
                 })
@@ -251,21 +445,35 @@ def build_run_detail(run_dir: Path) -> dict[str, Any]:
     }
 
 
-def inspect_dir(p: Path) -> dict[str, Any]:
-    kind = classify_dir(p)
-    subdirs, files = list_subdirs(p)
+def inspect_dir(rel: str) -> dict[str, Any]:
+    kind = classify_dir(rel)
+    subdirs, files = BACKEND.list_dir(rel)
+
+    enriched_subdirs: list[dict] = []
+    for s in subdirs:
+        if BACKEND.is_file(f"{s['path']}/run.json"):
+            child_kind = "run"
+        else:
+            grand_subs, _ = BACKEND.list_dir(s["path"])
+            child_kind = "dir"
+            for gs in grand_subs:
+                if BACKEND.is_file(f"{gs['path']}/run.json"):
+                    child_kind = "runs_container"
+                    break
+        enriched_subdirs.append({**s, "kind": child_kind})
+
     result: dict[str, Any] = {
-        "path": rel_path(p),
+        "path": rel,
         "kind": kind,
-        "breadcrumb": breadcrumb(p),
-        "subdirs": subdirs,
+        "breadcrumb": breadcrumb(rel),
+        "subdirs": enriched_subdirs,
         "files": files,
-        "root_name": ROOT.name or "/",
+        "root_name": BACKEND.root_label or "/",
     }
     if kind == "runs_container":
-        result["summary"] = build_summary(p)
+        result["summary"] = build_summary(rel)
     elif kind == "run":
-        result["run_detail"] = build_run_detail(p)
+        result["run_detail"] = build_run_detail(rel)
     return result
 
 
@@ -333,6 +541,7 @@ INDEX_HTML = r"""<!doctype html>
   .heading { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
   .heading code { background: #f1f3f7; padding: 1px 5px; border-radius: 3px; font-size: 12px; }
   .empty { color: var(--muted); padding: 16px 0; }
+  .loading { color: var(--muted); padding: 8px 0; font-style: italic; }
 </style>
 </head>
 <body>
@@ -356,6 +565,7 @@ function pathLink(path, label, extraClass='') {
 }
 
 async function loadPath(path) {
+  $('main').innerHTML = '<p class="loading">Loading…</p>';
   try {
     const r = await fetch('/api/inspect?path=' + encodeURIComponent(path || ''));
     if (!r.ok) {
@@ -596,41 +806,42 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def _handle_inspect(self, parsed: urllib.parse.ParseResult) -> None:
         qs = urllib.parse.parse_qs(parsed.query)
+        raw = qs.get("path", [""])[0]
         try:
-            target = resolve_safe(qs.get("path", [""])[0])
+            rel = _clean_rel(raw)
         except PermissionError as exc:
             return self._send_json({"error": str(exc)}, status=403)
-        if not target.exists():
-            return self._send_json({"error": f"not found: {qs.get('path', [''])[0]}"}, status=404)
-        if not target.is_dir():
-            return self._send_json({"error": "not a directory"}, status=400)
-        return self._send_json(inspect_dir(target))
+        if not BACKEND.is_dir(rel):
+            return self._send_json({"error": f"not a directory: {raw!r}"}, status=404)
+        try:
+            data = inspect_dir(rel)
+        except Exception as exc:  # surface backend errors as JSON
+            return self._send_json({"error": f"{type(exc).__name__}: {exc}"}, status=500)
+        return self._send_json(data)
 
     def _handle_file(self, parsed: urllib.parse.ParseResult) -> None:
         qs = urllib.parse.parse_qs(parsed.query)
+        raw = qs.get("path", [""])[0]
         try:
-            target = resolve_safe(qs.get("path", [""])[0])
+            rel = _clean_rel(raw)
         except PermissionError as exc:
             return self.send_error(403, str(exc))
-        if not target.is_file():
+        if not BACKEND.is_file(rel):
             return self.send_error(404, "file not found")
-        ctype = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
+        ctype = BACKEND.content_type(rel)
         try:
-            size = target.stat().st_size
-        except OSError as exc:
+            size = BACKEND.file_size(rel)
+        except Exception as exc:
             return self.send_error(500, str(exc))
         self.send_response(200)
         self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(size))
+        if size:
+            self.send_header("Content-Length", str(size))
         self.send_header("Cache-Control", "private, max-age=60")
         self.end_headers()
         try:
-            with target.open("rb") as f:
-                while True:
-                    chunk = f.read(64 * 1024)
-                    if not chunk:
-                        break
-                    self.wfile.write(chunk)
+            for chunk in BACKEND.stream(rel):
+                self.wfile.write(chunk)
         except (BrokenPipeError, ConnectionResetError):
             pass
 
@@ -660,26 +871,42 @@ class ThreadingServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     allow_reuse_address = True
 
 
+def make_backend(root: str, gcs_cache_ttl: float) -> Backend:
+    if root.startswith("gs://"):
+        without_scheme = root[len("gs://"):]
+        if "/" in without_scheme:
+            bucket, prefix = without_scheme.split("/", 1)
+        else:
+            bucket, prefix = without_scheme, ""
+        if not bucket:
+            raise ValueError(f"missing bucket in GCS root: {root!r}")
+        return GCSBackend(bucket, prefix, cache_ttl=gcs_cache_ttl)
+    return LocalBackend(Path(root))
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--root", type=Path, default=Path.cwd(),
-                        help="directory to serve (default: cwd)")
+    parser.add_argument("--root", default=str(Path.cwd()),
+                        help="local path or gs://bucket/prefix (default: cwd)")
     parser.add_argument("--port", type=int, default=8765, help="port (default: 8765)")
     parser.add_argument("--host", default="127.0.0.1",
                         help="bind host (default: 127.0.0.1; use 0.0.0.0 to expose on LAN)")
     parser.add_argument("--open", action="store_true",
                         help="open the viewer in the default browser on start")
+    parser.add_argument("--gcs-cache-ttl", type=float, default=30.0,
+                        help="seconds to cache GCS metadata listings (default: 30)")
     args = parser.parse_args(argv)
 
-    global ROOT
-    ROOT = args.root.resolve()
-    if not ROOT.is_dir():
-        print(f"--root {ROOT} is not a directory", file=sys.stderr)
+    global BACKEND
+    try:
+        BACKEND = make_backend(args.root, args.gcs_cache_ttl)
+    except (FileNotFoundError, ValueError, ImportError) as exc:
+        print(f"failed to open root: {exc}", file=sys.stderr)
         return 1
 
     server = ThreadingServer((args.host, args.port), Handler)
     url = f"http://{args.host}:{args.port}/"
-    print(f"Serving {ROOT} at {url}", file=sys.stderr)
+    print(f"Serving {BACKEND.root_label} at {url}", file=sys.stderr)
     if args.open:
         threading.Timer(0.5, lambda: webbrowser.open(url)).start()
     try:

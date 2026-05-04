@@ -494,7 +494,7 @@ def check_gate(
     if three is not None and three not in GATE_OUTCOMES:
         report.add("E_GATE_OUTCOME", path, f"three_seed_gate {three!r} not in {sorted(GATE_OUTCOMES)} or null")
 
-    cand_means = gate.get("candidate_means") or {}
+    cand_means = gate.get("candidate_means")
     if not isinstance(cand_means, dict):
         report.add("E_GATE_MEANS_SHAPE", path, "candidate_means must be an object")
         return
