@@ -170,6 +170,26 @@ Required: `schema_version`, `run_id`, `name`, `driver`,
 `{"completed", "failed", "interrupted"}`. `image_ids` MUST be a
 subset of the manifest entries for the named split.
 
+#### Optional: `related_runs` (cross-split linkage)
+
+A run targets exactly one split. To link the same prompt strategy's
+runs across splits (e.g. its `eval` evaluation and the
+corresponding `val` held-out check), include the optional
+`related_runs` field on each run:
+
+```json
+"related_runs": {
+  "val": "20260504T130000Z__claude-opus-4-7__add_palette_step_val",
+  "eval": "20260504T123456Z__claude-opus-4-7__add_palette_step"
+}
+```
+
+Keys are split names; values are existing `run_id`s. The link is
+informational — the checker treats it as an unknown-extra field and
+preserves it. Tools (e.g. `view_eval_results.py`) may use it to show a
+val column next to an eval row, or to flag overfitting when
+`composite_eval` rises while `composite_val` flattens.
+
 ### 2.3 `experiments/runs/<run_id>/config.json`
 
 Frozen snapshot of the configuration that produced this run. The

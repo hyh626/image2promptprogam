@@ -220,6 +220,110 @@ class ViewBuildersTests(unittest.TestCase):
         self.assertEqual(data["kind"], "runs_container")
         self.assertEqual(len(data["summary"]), 1)
         self.assertEqual(data["root_name"], v.BACKEND.root_label)
+        # Timeline must come along with the runs_container response.
+        self.assertIn("timeline", data)
+        t = data["timeline"]
+        self.assertEqual(len(t["runs"]), 1)
+        self.assertEqual(t["image_ids"], [IMAGE_ID])
+        cell = t["cells"][IMAGE_ID][RUN_ID]
+        self.assertEqual(set(cell["scores"].keys()), set(METRICS))
+        self.assertEqual(cell["decision"], "no_leader")
+        self.assertTrue(cell["generated_url"].endswith(
+            f"per_image/{IMAGE_ID}/generated.png"))
+        self.assertEqual(t["manifest"][IMAGE_ID]["split"], "eval")
+        self.assertEqual(
+            t["manifest"][IMAGE_ID]["target_url"],
+            "/api/file?path=eval_data/images/eval/" + IMAGE_ID + ".png",
+        )
+
+    def test_build_timeline_orders_by_started_at(self) -> None:
+        # Add a second run dated AFTER the existing fixture run and verify
+        # the timeline returns them oldest -> newest.
+        from tests._fixtures import RUN_ID as FIX_RUN_ID  # noqa: F401
+        second_run_id = "20260504T999999Z__claude-opus-4-7__followup"
+        run_dir = self.root / "experiments" / "runs" / second_run_id
+        per_image = run_dir / "per_image" / IMAGE_ID
+        per_image.mkdir(parents=True, exist_ok=True)
+        (per_image / "prompt.txt").write_text("p", encoding="utf-8")
+        (per_image / "generated.png").write_bytes(TINY_PNG)
+        (run_dir / "prompt_strategy.py").write_text("# v2\n", encoding="utf-8")
+        (run_dir / "stdout.log").write_text("ok\n", encoding="utf-8")
+        means = {m: 0.6 for m in METRICS}
+        composite = sum(means.values()) / len(means)
+        json_files = {
+            "run.json": {
+                "schema_version": "1.0.0",
+                "run_id": second_run_id,
+                "name": "followup",
+                "driver": "claude-opus-4-7",
+                "harness_variant": "opus4.7",
+                "started_at": "2026-06-01T08:00:00Z",
+                "finished_at": "2026-06-01T08:05:00Z",
+                "split": "eval",
+                "image_ids": [IMAGE_ID],
+                "seeds": [0],
+                "status": "completed",
+            },
+            "config.json": {
+                "schema_version": "1.0.0",
+                "harness_variant": "opus4.7",
+                "models": {"x": "y"},
+                "metrics": list(METRICS),
+            },
+            "aggregate.json": {
+                "schema_version": "1.0.0",
+                "run_id": second_run_id,
+                "split": "eval",
+                "n_images": 1,
+                "seeds": [0],
+                "means": means,
+                "composite": composite,
+                "composite_unweighted": composite,
+            },
+            "gate.json": {
+                "schema_version": "1.0.0",
+                "leader_run_id": RUN_ID,
+                "leader_means": {m: 0.5 for m in METRICS},
+                "leader_composite": 0.5,
+                "candidate_means": means,
+                "candidate_composite": composite,
+                "regression_epsilon": 0.01,
+                "no_regression": True,
+                "improves_composite": True,
+                "single_run_gate": "pass",
+                "decision": "promoted",
+            },
+        }
+        for fname, payload in json_files.items():
+            (run_dir / fname).write_text(
+                json.dumps(payload, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8")
+        scores_doc = {
+            "schema_version": "1.0.0",
+            "image_id": IMAGE_ID,
+            "seed": 0,
+            "scores": means,
+            "judge": None,
+            "generated_image_sha256": "a" * 64,
+            "prompt_sha256": "b" * 64,
+        }
+        (per_image / "scores.json").write_text(
+            json.dumps(scores_doc, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+        t = v.build_timeline("experiments/runs")
+        ordered_ids = [r["run_id"] for r in t["runs"]]
+        self.assertEqual(ordered_ids, [RUN_ID, second_run_id])
+        # Promoted column flagged as leader-chain entry
+        self.assertTrue(t["runs"][0]["is_leader_promotion"])  # no_leader counts
+        self.assertTrue(t["runs"][1]["is_leader_promotion"])  # promoted counts
+        # The cell for the second run should have its own scores/url
+        self.assertIn(second_run_id, t["cells"][IMAGE_ID])
+        self.assertNotEqual(
+            t["cells"][IMAGE_ID][RUN_ID]["composite"],
+            t["cells"][IMAGE_ID][second_run_id]["composite"],
+        )
 
     def test_inspect_dir_run(self) -> None:
         data = v.inspect_dir("experiments/runs/" + RUN_ID)

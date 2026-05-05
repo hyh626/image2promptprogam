@@ -374,6 +374,101 @@ def build_summary(container_rel: str) -> list[dict[str, Any]]:
     return rows
 
 
+def build_timeline(container_rel: str) -> dict[str, Any]:
+    """Per-image evolution across all runs under `container_rel`.
+
+    Returns a structure suitable for rendering a pivot grid:
+
+        {
+          "runs": [{run_id, path, name, driver, started_at, decision,
+                    composite, single_run_gate, is_leader_promotion}, ...],
+          "image_ids": ["hero_landscape_01", ...],   # union, order = first-seen
+          "manifest": {<image_id>: {target_url, split, category}},
+          "cells": {
+              <image_id>: {
+                  <run_id>: {generated_url, scores, decision, prompt_chars}
+              }
+          }
+        }
+    """
+    subdirs, _ = BACKEND.list_dir(container_rel)
+    runs: list[dict[str, Any]] = []
+    cells: dict[str, dict[str, dict[str, Any]]] = {}
+    image_ids: list[str] = []
+    seen_images: set[str] = set()
+
+    # Gather one entry per run (those with run.json)
+    for child in subdirs:
+        run_json_rel = f"{child['path']}/run.json"
+        if not BACKEND.is_file(run_json_rel):
+            continue
+        run = safe_load_json(run_json_rel) or {}
+        agg = safe_load_json(f"{child['path']}/aggregate.json") or {}
+        gate = safe_load_json(f"{child['path']}/gate.json") or {}
+        runs.append({
+            "run_id": child["name"],
+            "path": child["path"],
+            "name": run.get("name"),
+            "driver": run.get("driver"),
+            "split": run.get("split"),
+            "started_at": run.get("started_at"),
+            "decision": gate.get("decision"),
+            "single_run_gate": gate.get("single_run_gate"),
+            "composite": agg.get("composite"),
+            "is_leader_promotion": gate.get("decision") in ("promoted", "no_leader"),
+            "hypothesis": run.get("hypothesis"),
+        })
+
+        for image_id in run.get("image_ids") or []:
+            if image_id not in seen_images:
+                seen_images.add(image_id)
+                image_ids.append(image_id)
+            img_dir = f"{child['path']}/per_image/{image_id}"
+            scores_doc = safe_load_json(f"{img_dir}/scores.json") or {}
+            gen_path = f"{img_dir}/generated.png"
+            cell: dict[str, Any] = {
+                "scores": scores_doc.get("scores") or {},
+                "decision": gate.get("decision"),
+                "single_run_gate": gate.get("single_run_gate"),
+                "composite": agg.get("composite"),
+            }
+            if BACKEND.is_file(gen_path):
+                cell["generated_url"] = "/api/file?path=" + urllib.parse.quote(gen_path)
+            cells.setdefault(image_id, {})[child["name"]] = cell
+
+    # Sort runs chronologically (oldest first; promotion order reads naturally).
+    runs.sort(key=lambda r: r.get("started_at") or "")
+
+    # Resolve target images via manifest (walking up from the container).
+    manifest = load_manifest_for(container_rel) if image_ids else {}
+    manifest_block: dict[str, dict[str, Any]] = {}
+    for image_id in image_ids:
+        meta = manifest.get(image_id)
+        if not meta:
+            manifest_block[image_id] = {"target_url": None, "split": None,
+                                        "category": None}
+            continue
+        split = meta["__split__"]
+        mdir = meta["__manifest_dir__"]
+        filename = meta.get("filename")
+        target_url = None
+        if filename:
+            target_rel = f"{mdir}/{split}/{filename}" if mdir else f"{split}/{filename}"
+            target_url = "/api/file?path=" + urllib.parse.quote(target_rel)
+        manifest_block[image_id] = {
+            "target_url": target_url,
+            "split": split,
+            "category": meta.get("category"),
+        }
+
+    return {
+        "runs": runs,
+        "image_ids": image_ids,
+        "manifest": manifest_block,
+        "cells": cells,
+    }
+
+
 def build_run_detail(run_rel: str) -> dict[str, Any]:
     run = safe_load_json(f"{run_rel}/run.json") or {}
     agg = safe_load_json(f"{run_rel}/aggregate.json") or {}
@@ -472,6 +567,7 @@ def inspect_dir(rel: str) -> dict[str, Any]:
     }
     if kind == "runs_container":
         result["summary"] = build_summary(rel)
+        result["timeline"] = build_timeline(rel)
     elif kind == "run":
         result["run_detail"] = build_run_detail(rel)
     return result
@@ -542,6 +638,31 @@ INDEX_HTML = r"""<!doctype html>
   .heading code { background: #f1f3f7; padding: 1px 5px; border-radius: 3px; font-size: 12px; }
   .empty { color: var(--muted); padding: 16px 0; }
   .loading { color: var(--muted); padding: 8px 0; font-style: italic; }
+  .tabs { display: flex; gap: 4px; margin: 0 0 12px 0; border-bottom: 1px solid var(--border); }
+  .tabs .tab { background: none; border: 1px solid transparent; border-bottom: none; padding: 6px 12px; font-size: 13px; cursor: pointer; color: var(--muted); border-radius: 4px 4px 0 0; }
+  .tabs .tab.active { color: var(--fg); border-color: var(--border); background: var(--panel); margin-bottom: -1px; }
+  .tabs .tab:hover { color: var(--fg); }
+  .timeline-wrap { overflow: auto; max-width: 100%; }
+  table.timeline { border-collapse: separate; border-spacing: 0; background: var(--panel); border: 1px solid var(--border); }
+  table.timeline th, table.timeline td { padding: 6px 8px; border-bottom: 1px solid var(--border); border-right: 1px solid var(--border); vertical-align: top; }
+  table.timeline thead th { background: #f5f6f9; font-size: 12px; text-align: left; }
+  table.timeline tbody th { text-align: left; font-weight: 600; font-size: 12.5px; min-width: 160px; max-width: 220px; word-break: break-word; }
+  .tcol { min-width: 180px; max-width: 220px; }
+  .tcol-head a { color: var(--accent); text-decoration: none; word-break: break-all; }
+  .tcol-head a:hover { text-decoration: underline; }
+  .tcol-meta { color: var(--muted); font-size: 11px; margin-top: 2px; }
+  .tcell { width: 180px; max-width: 200px; text-align: center; }
+  .tcell img { max-width: 160px; max-height: 130px; border: 1px solid var(--border); border-radius: 3px; background: #f5f5f5; }
+  .tcell.promoted { background: #f4faf6; }
+  .tcell.rejected { background: #fdf6f6; }
+  .tcell-img { background: #fafbfd; }
+  .tcell-target img { max-height: 130px; }
+  .tplaceholder { height: 100px; display: flex; align-items: center; justify-content: center; color: var(--muted); font-size: 11px; background: #f9f9f9; border: 1px dashed var(--border); border-radius: 3px; }
+  .tscores { font-family: ui-monospace, "SFMono-Regular", Menlo, monospace; font-size: 11px; margin-top: 4px; word-break: break-all; }
+  .tscores.tdetail { color: var(--muted); font-size: 10.5px; }
+  .tscores .pos { color: var(--good); }
+  .tscores .neg { color: var(--bad); }
+  .tcell-target-head, .tcell-img-head { background: #f0f2f7; }
 </style>
 </head>
 <body>
@@ -564,7 +685,14 @@ function pathLink(path, label, extraClass='') {
   return `<a href="#${encodeURIComponent(path)}" data-path="${escapeHtml(path)}" class="link ${extraClass}">${escapeHtml(label)}</a>`;
 }
 
+function pathFromHash() {
+  const raw = decodeURIComponent(location.hash.slice(1) || '');
+  return raw.split('?')[0];
+}
+
 async function loadPath(path) {
+  // Drop any '?tab=…' suffix that may have been included in the hash.
+  path = (path || '').split('?')[0];
   $('main').innerHTML = '<p class="loading">Loading…</p>';
   try {
     const r = await fetch('/api/inspect?path=' + encodeURIComponent(path || ''));
@@ -582,6 +710,7 @@ async function loadPath(path) {
 }
 
 function render(d) {
+  window.__lastData = d;
   $('sidebar').innerHTML = renderSidebar(d);
   $('main').innerHTML = renderMain(d);
 }
@@ -615,10 +744,35 @@ function renderSidebar(d) {
   return html;
 }
 
+function currentTab() {
+  const t = (location.hash.match(/[?&]tab=([^&]+)/) || [])[1];
+  return t === 'timeline' || t === 'leader-only' ? t : 'summary';
+}
+function setTab(tab) {
+  const path = decodeURIComponent((location.hash.split('?')[0] || '').replace(/^#/, ''));
+  const newHash = '#' + encodeURIComponent(path) + (tab === 'summary' ? '' : '?tab=' + tab);
+  history.replaceState({path}, '', newHash);
+}
+
 function renderMain(d) {
   if (d.kind === 'run') return renderRun(d.run_detail || {});
-  if (d.kind === 'runs_container') return renderSummary(d);
+  if (d.kind === 'runs_container') return renderRunsContainer(d);
   return renderPlainDir(d);
+}
+
+function renderRunsContainer(d) {
+  const tab = currentTab();
+  const tabBtn = (id, label) =>
+    `<button class="tab ${tab === id ? 'active' : ''}" data-tab="${id}">${escapeHtml(label)}</button>`;
+  const tabs =
+    `<div class="tabs">${tabBtn('summary', 'Summary')}` +
+    `${tabBtn('timeline', 'Timeline')}` +
+    `${tabBtn('leader-only', 'Leader chain')}</div>`;
+  let body;
+  if (tab === 'timeline') body = renderTimeline(d.timeline || {}, false);
+  else if (tab === 'leader-only') body = renderTimeline(d.timeline || {}, true);
+  else body = renderSummary(d);
+  return tabs + body;
 }
 
 function renderPlainDir(d) {
@@ -702,6 +856,85 @@ function renderJudge(judge) {
   return Object.entries(judge).map(([k, v]) => `${escapeHtml(k)}=${escapeHtml(String(v))}`).join(' · ');
 }
 
+function renderTimeline(t, leaderOnly) {
+  const allRuns = t.runs || [];
+  const runs = leaderOnly ? allRuns.filter(r => r.is_leader_promotion) : allRuns;
+  const imageIds = t.image_ids || [];
+  const cells = t.cells || {};
+  const manifest = t.manifest || {};
+
+  const subtitle = leaderOnly
+    ? `Leader chain — ${runs.length} promoted run${runs.length === 1 ? '' : 's'}, ${imageIds.length} image${imageIds.length === 1 ? '' : 's'}`
+    : `All runs — ${runs.length} run${runs.length === 1 ? '' : 's'}, ${imageIds.length} image${imageIds.length === 1 ? '' : 's'}`;
+
+  if (!runs.length || !imageIds.length) {
+    return `<p class="hint">${escapeHtml(subtitle)}</p><p class="empty">Nothing to compare yet.</p>`;
+  }
+
+  let html = `<p class="meta-row">${escapeHtml(subtitle)}. Images on the rows, runs on the columns (left = oldest).</p>`;
+  html += '<div class="timeline-wrap"><table class="timeline">';
+  // Header row: "image" + per-run columns
+  html += '<thead><tr><th class="tcell-img-head">image</th><th class="tcell-target-head">target</th>';
+  for (const r of runs) {
+    const cls = r.decision === 'promoted' || r.decision === 'no_leader' ? 'promoted'
+              : r.decision === 'rejected' ? 'rejected' : '';
+    html += `<th class="tcol ${cls}"><div class="tcol-head">`;
+    html += `<a href="#${encodeURIComponent(r.path)}" data-path="${escapeHtml(r.path)}">${escapeHtml(r.name || r.run_id)}</a>`;
+    html += `<div class="tcol-meta">${escapeHtml((r.started_at || '').replace('T', ' ').replace('Z', ''))}</div>`;
+    html += `<div class="tcol-meta">${decisionPill(r.decision)} composite=<b>${fmt(r.composite, 4)}</b></div>`;
+    html += '</div></th>';
+  }
+  html += '</tr></thead><tbody>';
+
+  for (const imageId of imageIds) {
+    const meta = manifest[imageId] || {};
+    html += `<tr><th class="tcell-img"><div>${escapeHtml(imageId)}</div>`;
+    if (meta.split) html += `<div class="tcol-meta">split: <code>${escapeHtml(meta.split)}</code></div>`;
+    if (meta.category) html += `<div class="tcol-meta">${escapeHtml(meta.category)}</div>`;
+    html += '</th>';
+    if (meta.target_url) {
+      html += `<td class="tcell tcell-target"><a href="${meta.target_url}" target="_blank"><img src="${meta.target_url}" alt="target"></a></td>`;
+    } else {
+      html += '<td class="tcell tcell-target"><div class="tplaceholder">no target</div></td>';
+    }
+    const row = cells[imageId] || {};
+    let prevComposite = null;
+    for (const r of runs) {
+      const c = row[r.run_id];
+      const cls = r.decision === 'promoted' || r.decision === 'no_leader' ? 'promoted'
+                : r.decision === 'rejected' ? 'rejected' : '';
+      html += `<td class="tcell ${cls}">`;
+      if (c) {
+        if (c.generated_url) {
+          html += `<a href="${c.generated_url}" target="_blank"><img src="${c.generated_url}" alt="generated"></a>`;
+        } else {
+          html += '<div class="tplaceholder">no png</div>';
+        }
+        // Compose a compact score line; bold composite delta vs previous shown run.
+        const composite = c.composite;
+        let delta = '';
+        if (typeof prevComposite === 'number' && typeof composite === 'number') {
+          const d = composite - prevComposite;
+          const sign = d > 0 ? '+' : '';
+          const dcls = d > 0 ? 'pos' : (d < 0 ? 'neg' : '');
+          delta = ` <span class="${dcls}">(${sign}${d.toFixed(3)})</span>`;
+        }
+        html += `<div class="tscores">composite=<b>${fmt(composite, 4)}</b>${delta}</div>`;
+        const s = c.scores || {};
+        const compact = Object.entries(s).map(([k, v]) => `${escapeHtml(k.replace('s_', ''))}=${fmt(v, 3)}`).join(' · ');
+        if (compact) html += `<div class="tscores tdetail">${compact}</div>`;
+      } else {
+        html += '<div class="tplaceholder">not in run</div>';
+      }
+      html += '</td>';
+      if (c && typeof c.composite === 'number') prevComposite = c.composite;
+    }
+    html += '</tr>';
+  }
+  html += '</tbody></table></div>';
+  return html;
+}
+
 function renderRun(d) {
   const run = d.run || {};
   const agg = d.aggregate || {};
@@ -772,6 +1005,14 @@ function renderRun(d) {
 }
 
 document.addEventListener('click', (e) => {
+  const tabBtn = e.target.closest('[data-tab]');
+  if (tabBtn) {
+    e.preventDefault();
+    setTab(tabBtn.getAttribute('data-tab'));
+    // re-render without re-fetching: re-use the last loaded data on the page.
+    if (window.__lastData) render(window.__lastData);
+    return;
+  }
   const a = e.target.closest('[data-path]');
   if (!a) return;
   e.preventDefault();
@@ -781,12 +1022,10 @@ document.addEventListener('click', (e) => {
 });
 
 window.addEventListener('popstate', () => {
-  const path = decodeURIComponent(location.hash.slice(1)) || '';
-  loadPath(path);
+  loadPath(pathFromHash());
 });
 
-const initial = decodeURIComponent(location.hash.slice(1)) || '';
-loadPath(initial);
+loadPath(pathFromHash());
 </script>
 </body>
 </html>
