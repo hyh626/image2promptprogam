@@ -488,14 +488,26 @@ in the run artifacts.
 
 ## 6. Verifying conformance
 
-The checker lives at the repo root: `check_eval_storage.py`.
+The checker lives at the repo root: `check_eval_storage.py`. It accepts
+either a local directory or a `gs://bucket/prefix` URI as `--root`, so
+the same tool validates both a freshly-built local repo and the
+canonical GCS mirror produced by `sync_runs_to_gcs.py`.
 
 ```bash
 python check_eval_storage.py --root /path/to/built/repo
 python check_eval_storage.py --root . --verify-hashes
 python check_eval_storage.py --root . --json     # machine-readable output
+python check_eval_storage.py --root gs://image2promptdata/experiments
+python check_eval_storage.py --root gs://my-bucket/mirror --verify-hashes
 ```
+
+GCS reads stream through `google-cloud-storage` with Application Default
+Credentials. Install with `pip install google-cloud-storage` (or
+`pip install -e '.[gcs]'`) and authenticate with
+`gcloud auth application-default login`.
 
 Exit code is `0` on success, `1` on any violation. Each violation
 prints one line with a stable code (e.g. `E_AGG_MISMATCH`,
-`E_LEADER_MISSING`) so CI can grep for specific failures.
+`E_LEADER_RUN_MISSING`) and an absolute path — a local filesystem
+path for `LocalBackend`, a `gs://...` URI for `GCSBackend` — so CI
+can grep for specific failures.

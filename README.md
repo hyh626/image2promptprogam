@@ -28,7 +28,8 @@ gemini3.1pro/
 
 prepare_agent_task.sh     # Creates a standalone task folder
 EVAL_STORAGE_SCHEMA.md    # Canonical eval output storage schema
-check_eval_storage.py     # Conformance checker for built task repos
+check_eval_storage.py     # Conformance checker (local path or gs:// URI)
+storage_backend.py        # Local + GCS backend used by checker and viewer
 view_eval_results.py      # Local web viewer for experiment results
 sync_runs_to_gcs.py       # Mirror experiment results to GCS
 prompts                   # Conversation notes used to create the specs

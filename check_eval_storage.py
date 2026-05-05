@@ -3,6 +3,10 @@
 
 Usage:
     python check_eval_storage.py --root <repo-root> [--verify-hashes] [--json]
+    python check_eval_storage.py --root gs://bucket/prefix [--verify-hashes]
+
+Roots may be local directories or `gs://bucket/prefix` URIs. GCS reads go
+through the google-cloud-storage SDK with Application Default Credentials.
 
 Exit code: 0 on success, 1 on any violation.
 Each violation prints one line: <CODE> <path>: <message>.
@@ -18,6 +22,8 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
+
+from storage_backend import Backend, make_backend
 
 SCHEMA_VERSION = "1.0.0"
 SPLITS = ("train", "eval", "val", "holdout")
@@ -43,7 +49,7 @@ class Report:
     violations: list[Violation] = field(default_factory=list)
     files_checked: int = 0
 
-    def add(self, code: str, path: Path | str, message: str) -> None:
+    def add(self, code: str, path: Any, message: str) -> None:
         self.violations.append(Violation(code, str(path), message))
 
     @property
@@ -54,15 +60,20 @@ class Report:
 # --------------------------- helpers ---------------------------
 
 
-def load_json(path: Path, report: Report) -> dict | list | None:
-    try:
-        with path.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-    except FileNotFoundError:
-        report.add("E_FILE_MISSING", path, "required file is missing")
+def load_json(backend: Backend, rel: str, report: Report) -> dict | list | None:
+    """Load and parse JSON at backend://rel. Records E_FILE_MISSING / E_JSON_INVALID."""
+    if not backend.is_file(rel):
+        report.add("E_FILE_MISSING", backend.format_path(rel), "required file is missing")
         return None
+    try:
+        text = backend.read_text(rel)
+    except Exception as exc:  # network / permissions / etc.
+        report.add("E_JSON_INVALID", backend.format_path(rel), f"could not read: {exc}")
+        return None
+    try:
+        data = json.loads(text)
     except json.JSONDecodeError as exc:
-        report.add("E_JSON_INVALID", path, f"invalid JSON: {exc}")
+        report.add("E_JSON_INVALID", backend.format_path(rel), f"invalid JSON: {exc}")
         return None
     report.files_checked += 1
     return data
@@ -77,7 +88,8 @@ def is_finite_unit_float(value: Any) -> bool:
     )
 
 
-def require_keys(obj: dict, keys: Iterable[str], path: Path, report: Report, code: str = "E_FIELD_MISSING") -> bool:
+def require_keys(obj: dict, keys: Iterable[str], path: Any, report: Report,
+                 code: str = "E_FIELD_MISSING") -> bool:
     ok = True
     for k in keys:
         if k not in obj:
@@ -86,7 +98,7 @@ def require_keys(obj: dict, keys: Iterable[str], path: Path, report: Report, cod
     return ok
 
 
-def require_schema_version(obj: dict, path: Path, report: Report) -> None:
+def require_schema_version(obj: dict, path: Any, report: Report) -> None:
     if obj.get("schema_version") != SCHEMA_VERSION:
         report.add(
             "E_SCHEMA_VERSION",
@@ -95,11 +107,9 @@ def require_schema_version(obj: dict, path: Path, report: Report) -> None:
         )
 
 
-def sha256_file(path: Path) -> str:
+def sha256_bytes(data: bytes) -> str:
     h = hashlib.sha256()
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(chunk)
+    h.update(data)
     return h.hexdigest()
 
 
@@ -107,74 +117,89 @@ def approx_equal(a: float, b: float, tol: float = FLOAT_TOL) -> bool:
     return abs(float(a) - float(b)) <= tol
 
 
+def join(*parts: str) -> str:
+    """Join non-empty path parts with '/'."""
+    return "/".join(p.strip("/") for p in parts if p)
+
+
 # --------------------------- manifest ---------------------------
 
 
-def check_manifest(root: Path, report: Report, verify_hashes: bool) -> dict[str, dict[str, dict]]:
+def check_manifest(backend: Backend, report: Report,
+                   verify_hashes: bool) -> dict[str, dict[str, dict]]:
     """Return {split: {image_id: entry}} for downstream cross-checks."""
     by_split: dict[str, dict[str, dict]] = {s: {} for s in SPLITS}
 
-    manifest_path = root / "eval_data" / "images" / "manifest.json"
-    data = load_json(manifest_path, report)
+    manifest_rel = "eval_data/images/manifest.json"
+    manifest_disp = backend.format_path(manifest_rel)
+    data = load_json(backend, manifest_rel, report)
     if not isinstance(data, dict):
         if data is not None:
-            report.add("E_MANIFEST_SHAPE", manifest_path, "manifest must be an object")
+            report.add("E_MANIFEST_SHAPE", manifest_disp, "manifest must be an object")
         return by_split
 
-    require_schema_version(data, manifest_path, report)
+    require_schema_version(data, manifest_disp, report)
     splits = data.get("splits")
     if not isinstance(splits, dict):
-        report.add("E_MANIFEST_SHAPE", manifest_path, "missing 'splits' object")
+        report.add("E_MANIFEST_SHAPE", manifest_disp, "missing 'splits' object")
         return by_split
 
     seen_ids: dict[str, str] = {}
     for split_name in SPLITS:
         entries = splits.get(split_name)
         if entries is None:
-            report.add("E_MANIFEST_SPLIT", manifest_path, f"split {split_name!r} missing")
+            report.add("E_MANIFEST_SPLIT", manifest_disp, f"split {split_name!r} missing")
             continue
         if not isinstance(entries, list):
-            report.add("E_MANIFEST_SPLIT", manifest_path, f"split {split_name!r} must be a list")
+            report.add("E_MANIFEST_SPLIT", manifest_disp,
+                       f"split {split_name!r} must be a list")
             continue
         for entry in entries:
             if not isinstance(entry, dict):
-                report.add("E_MANIFEST_ENTRY", manifest_path, f"non-object entry in {split_name}")
+                report.add("E_MANIFEST_ENTRY", manifest_disp,
+                           f"non-object entry in {split_name}")
                 continue
             if not require_keys(
-                entry, ("image_id", "filename", "sha256", "width", "height"), manifest_path, report
+                entry, ("image_id", "filename", "sha256", "width", "height"),
+                manifest_disp, report,
             ):
                 continue
             image_id = entry["image_id"]
             if image_id in seen_ids:
                 report.add(
-                    "E_MANIFEST_DUPLICATE",
-                    manifest_path,
-                    f"image_id {image_id!r} appears in both {seen_ids[image_id]!r} and {split_name!r}",
+                    "E_MANIFEST_DUPLICATE", manifest_disp,
+                    f"image_id {image_id!r} appears in both "
+                    f"{seen_ids[image_id]!r} and {split_name!r}",
                 )
                 continue
             seen_ids[image_id] = split_name
             if not SHA256_RE.match(str(entry["sha256"])):
-                report.add(
-                    "E_MANIFEST_HASH_FORMAT",
-                    manifest_path,
-                    f"image_id {image_id!r} has malformed sha256",
-                )
+                report.add("E_MANIFEST_HASH_FORMAT", manifest_disp,
+                           f"image_id {image_id!r} has malformed sha256")
             if not (isinstance(entry["width"], int) and entry["width"] > 0):
-                report.add("E_MANIFEST_DIMS", manifest_path, f"{image_id} width must be positive int")
+                report.add("E_MANIFEST_DIMS", manifest_disp,
+                           f"{image_id} width must be positive int")
             if not (isinstance(entry["height"], int) and entry["height"] > 0):
-                report.add("E_MANIFEST_DIMS", manifest_path, f"{image_id} height must be positive int")
+                report.add("E_MANIFEST_DIMS", manifest_disp,
+                           f"{image_id} height must be positive int")
             by_split[split_name][image_id] = entry
 
             if verify_hashes:
-                img_path = root / "eval_data" / "images" / split_name / entry["filename"]
-                if not img_path.exists():
-                    report.add("E_IMAGE_MISSING", img_path, "manifest entry references missing file")
+                img_rel = join("eval_data", "images", split_name, entry["filename"])
+                img_disp = backend.format_path(img_rel)
+                if not backend.is_file(img_rel):
+                    report.add("E_IMAGE_MISSING", img_disp,
+                               "manifest entry references missing file")
                 else:
-                    actual = sha256_file(img_path)
+                    try:
+                        actual = sha256_bytes(backend.read_bytes(img_rel))
+                    except Exception as exc:
+                        report.add("E_IMAGE_MISSING", img_disp,
+                                   f"could not read for hashing: {exc}")
+                        continue
                     if actual != entry["sha256"]:
                         report.add(
-                            "E_IMAGE_HASH_MISMATCH",
-                            img_path,
+                            "E_IMAGE_HASH_MISMATCH", img_disp,
                             f"sha256 mismatch (manifest={entry['sha256']}, actual={actual})",
                         )
     return by_split
@@ -184,161 +209,183 @@ def check_manifest(root: Path, report: Report, verify_hashes: bool) -> dict[str,
 
 
 def check_run(
-    run_dir: Path,
+    backend: Backend,
+    run_rel: str,
     report: Report,
     manifest_by_split: dict[str, dict[str, dict]],
     verify_hashes: bool,
 ) -> dict[str, Any] | None:
-    run_id = run_dir.name
+    run_id = run_rel.rsplit("/", 1)[-1]
+    run_disp = backend.format_path(run_rel)
     if not RUN_ID_RE.match(run_id):
-        report.add("E_RUN_ID_FORMAT", run_dir, f"run_id {run_id!r} does not match canonical format")
+        report.add("E_RUN_ID_FORMAT", run_disp,
+                   f"run_id {run_id!r} does not match canonical format")
 
-    run_json = load_json(run_dir / "run.json", report)
+    run_json_rel = join(run_rel, "run.json")
+    run_json_disp = backend.format_path(run_json_rel)
+    run_json = load_json(backend, run_json_rel, report)
     if not isinstance(run_json, dict):
         return None
 
-    require_schema_version(run_json, run_dir / "run.json", report)
+    require_schema_version(run_json, run_json_disp, report)
     require_keys(
         run_json,
-        (
-            "run_id", "name", "driver", "harness_variant",
-            "started_at", "finished_at", "split", "image_ids",
-            "seeds", "status",
-        ),
-        run_dir / "run.json",
-        report,
+        ("run_id", "name", "driver", "harness_variant",
+         "started_at", "finished_at", "split", "image_ids",
+         "seeds", "status"),
+        run_json_disp, report,
     )
 
     if run_json.get("run_id") != run_id:
-        report.add(
-            "E_RUN_ID_MISMATCH",
-            run_dir / "run.json",
-            f"run.json#run_id {run_json.get('run_id')!r} does not match directory name {run_id!r}",
-        )
+        report.add("E_RUN_ID_MISMATCH", run_json_disp,
+                   f"run.json#run_id {run_json.get('run_id')!r} "
+                   f"does not match directory name {run_id!r}")
 
     for ts_field in ("started_at", "finished_at"):
         ts = run_json.get(ts_field)
         if isinstance(ts, str) and not ISO_UTC_RE.match(ts):
-            report.add(
-                "E_TIMESTAMP_FORMAT",
-                run_dir / "run.json",
-                f"{ts_field} {ts!r} must match YYYY-MM-DDTHH:MM:SSZ",
-            )
+            report.add("E_TIMESTAMP_FORMAT", run_json_disp,
+                       f"{ts_field} {ts!r} must match YYYY-MM-DDTHH:MM:SSZ")
 
     status = run_json.get("status")
     if status not in RUN_STATUS:
-        report.add("E_RUN_STATUS", run_dir / "run.json", f"status {status!r} not in {sorted(RUN_STATUS)}")
+        report.add("E_RUN_STATUS", run_json_disp,
+                   f"status {status!r} not in {sorted(RUN_STATUS)}")
 
     split = run_json.get("split")
     if split not in SPLITS:
-        report.add("E_RUN_SPLIT", run_dir / "run.json", f"split {split!r} not in {SPLITS}")
+        report.add("E_RUN_SPLIT", run_json_disp,
+                   f"split {split!r} not in {SPLITS}")
 
     image_ids = run_json.get("image_ids") or []
     if not isinstance(image_ids, list) or not all(isinstance(x, str) for x in image_ids):
-        report.add("E_RUN_IMAGE_IDS", run_dir / "run.json", "image_ids must be a list of strings")
+        report.add("E_RUN_IMAGE_IDS", run_json_disp,
+                   "image_ids must be a list of strings")
         image_ids = []
     elif split in SPLITS:
         manifest_ids = manifest_by_split.get(split, {})
         for img in image_ids:
             if img not in manifest_ids:
-                report.add(
-                    "E_RUN_IMAGE_UNKNOWN",
-                    run_dir / "run.json",
-                    f"image_id {img!r} not in manifest split {split!r}",
-                )
+                report.add("E_RUN_IMAGE_UNKNOWN", run_json_disp,
+                           f"image_id {img!r} not in manifest split {split!r}")
 
     seeds = run_json.get("seeds") or []
     if not isinstance(seeds, list) or not seeds or not all(isinstance(x, int) for x in seeds):
-        report.add("E_RUN_SEEDS", run_dir / "run.json", "seeds must be a non-empty list of ints")
+        report.add("E_RUN_SEEDS", run_json_disp,
+                   "seeds must be a non-empty list of ints")
 
-    config = load_json(run_dir / "config.json", report)
+    config_rel = join(run_rel, "config.json")
+    config = load_json(backend, config_rel, report)
+    config_disp = backend.format_path(config_rel)
     metrics: list[str] = []
     if isinstance(config, dict):
-        require_schema_version(config, run_dir / "config.json", report)
-        require_keys(config, ("harness_variant", "models", "metrics"), run_dir / "config.json", report)
+        require_schema_version(config, config_disp, report)
+        require_keys(config, ("harness_variant", "models", "metrics"), config_disp, report)
         metrics = config.get("metrics") or []
         if not isinstance(metrics, list) or not metrics or not all(isinstance(m, str) for m in metrics):
-            report.add("E_CONFIG_METRICS", run_dir / "config.json", "metrics must be a non-empty list of strings")
+            report.add("E_CONFIG_METRICS", config_disp,
+                       "metrics must be a non-empty list of strings")
             metrics = []
 
-    if not (run_dir / "prompt_strategy.py").exists():
-        report.add("E_FILE_MISSING", run_dir / "prompt_strategy.py", "strategy snapshot missing")
-    if not (run_dir / "stdout.log").exists():
-        report.add("E_FILE_MISSING", run_dir / "stdout.log", "stdout.log missing")
+    for sibling in ("prompt_strategy.py", "stdout.log"):
+        sibling_rel = join(run_rel, sibling)
+        if not backend.is_file(sibling_rel):
+            report.add("E_FILE_MISSING", backend.format_path(sibling_rel),
+                       f"{sibling} missing")
 
-    per_image_dir = run_dir / "per_image"
+    per_image_rel = join(run_rel, "per_image")
+    per_image_disp = backend.format_path(per_image_rel)
     per_image_means: dict[str, list[float]] = {m: [] for m in metrics}
-    if not per_image_dir.is_dir():
-        report.add("E_FILE_MISSING", per_image_dir, "per_image/ directory missing")
+    if not backend.is_dir(per_image_rel):
+        report.add("E_FILE_MISSING", per_image_disp, "per_image/ directory missing")
     else:
         for img in image_ids:
-            img_dir = per_image_dir / img
-            if not img_dir.is_dir():
-                report.add("E_FILE_MISSING", img_dir, f"per_image/{img}/ missing")
+            img_rel = join(per_image_rel, img)
+            img_disp = backend.format_path(img_rel)
+            if not backend.is_dir(img_rel):
+                report.add("E_FILE_MISSING", img_disp, f"per_image/{img}/ missing")
                 continue
             for fname in ("prompt.txt", "generated.png", "scores.json"):
-                if not (img_dir / fname).exists() and not (
-                    fname == "generated.png" and len(seeds) > 1
-                ):
-                    # For multi-seed runs the top-level generated.png is optional.
-                    if fname == "generated.png":
-                        report.add("E_FILE_MISSING", img_dir / fname, "generated.png missing")
-                    else:
-                        report.add("E_FILE_MISSING", img_dir / fname, f"{fname} missing")
+                fpath_rel = join(img_rel, fname)
+                if not backend.is_file(fpath_rel):
+                    if fname == "generated.png" and len(seeds) > 1:
+                        # multi-seed: top-level generated.png is optional
+                        continue
+                    report.add("E_FILE_MISSING", backend.format_path(fpath_rel),
+                               f"{fname} missing")
 
-            scores = load_json(img_dir / "scores.json", report)
+            scores_rel = join(img_rel, "scores.json")
+            scores = load_json(backend, scores_rel, report)
             if isinstance(scores, dict):
-                check_scores(scores, img_dir / "scores.json", img, metrics, report,
+                check_scores(scores, backend.format_path(scores_rel), img, metrics, report,
                              multi_seed=len(seeds) > 1)
                 got = scores.get("scores") or {}
                 for m in metrics:
                     if m in got and is_finite_unit_float(got[m]):
                         per_image_means[m].append(float(got[m]))
 
-                if verify_hashes and (img_dir / "generated.png").exists():
+                gen_rel = join(img_rel, "generated.png")
+                if verify_hashes and backend.is_file(gen_rel):
                     expected = scores.get("generated_image_sha256")
                     if isinstance(expected, str) and SHA256_RE.match(expected):
-                        actual = sha256_file(img_dir / "generated.png")
-                        if actual != expected:
-                            report.add(
-                                "E_GENERATED_HASH_MISMATCH",
-                                img_dir / "generated.png",
-                                f"sha256 mismatch (expected={expected}, actual={actual})",
-                            )
+                        try:
+                            actual = sha256_bytes(backend.read_bytes(gen_rel))
+                        except Exception as exc:
+                            report.add("E_GENERATED_HASH_MISMATCH", backend.format_path(gen_rel),
+                                       f"could not read for hashing: {exc}")
+                        else:
+                            if actual != expected:
+                                report.add(
+                                    "E_GENERATED_HASH_MISMATCH",
+                                    backend.format_path(gen_rel),
+                                    f"sha256 mismatch (expected={expected}, actual={actual})",
+                                )
 
-            seeds_dir = img_dir / "seeds"
+            seeds_rel = join(img_rel, "seeds")
             if len(seeds) > 1:
-                if not seeds_dir.is_dir():
-                    report.add("E_FILE_MISSING", seeds_dir, "multi-seed run missing seeds/ subdir")
+                if not backend.is_dir(seeds_rel):
+                    report.add("E_FILE_MISSING", backend.format_path(seeds_rel),
+                               "multi-seed run missing seeds/ subdir")
                 else:
                     for seed in seeds:
-                        seed_dir = seeds_dir / str(seed)
-                        if not seed_dir.is_dir():
-                            report.add("E_FILE_MISSING", seed_dir, f"seeds/{seed}/ missing")
+                        seed_rel = join(seeds_rel, str(seed))
+                        if not backend.is_dir(seed_rel):
+                            report.add("E_FILE_MISSING", backend.format_path(seed_rel),
+                                       f"seeds/{seed}/ missing")
                             continue
                         for fname in ("generated.png", "scores.json"):
-                            if not (seed_dir / fname).exists():
-                                report.add("E_FILE_MISSING", seed_dir / fname, f"{fname} missing")
-                        seed_scores = load_json(seed_dir / "scores.json", report)
+                            if not backend.is_file(join(seed_rel, fname)):
+                                report.add("E_FILE_MISSING",
+                                           backend.format_path(join(seed_rel, fname)),
+                                           f"{fname} missing")
+                        seed_scores_rel = join(seed_rel, "scores.json")
+                        seed_scores = load_json(backend, seed_scores_rel, report)
                         if isinstance(seed_scores, dict):
-                            check_scores(seed_scores, seed_dir / "scores.json", img, metrics, report,
-                                         multi_seed=False, expect_seed=seed)
+                            check_scores(
+                                seed_scores, backend.format_path(seed_scores_rel),
+                                img, metrics, report,
+                                multi_seed=False, expect_seed=seed,
+                            )
 
-    aggregate = load_json(run_dir / "aggregate.json", report)
+    aggregate_rel = join(run_rel, "aggregate.json")
+    aggregate_disp = backend.format_path(aggregate_rel)
+    aggregate = load_json(backend, aggregate_rel, report)
     if isinstance(aggregate, dict):
-        check_aggregate(aggregate, run_dir / "aggregate.json", run_id, split, image_ids,
+        check_aggregate(aggregate, aggregate_disp, run_id, split, image_ids,
                         metrics, per_image_means, report)
 
-    gate = load_json(run_dir / "gate.json", report)
+    gate_rel = join(run_rel, "gate.json")
+    gate_disp = backend.format_path(gate_rel)
+    gate = load_json(backend, gate_rel, report)
     if isinstance(gate, dict) and isinstance(aggregate, dict):
-        check_gate(gate, run_dir / "gate.json", aggregate, metrics, report)
+        check_gate(gate, gate_disp, aggregate, metrics, report)
 
     return {"run_id": run_id, "aggregate": aggregate}
 
 
 def check_scores(
     scores: dict,
-    path: Path,
+    path: Any,
     expected_image: str,
     metrics: list[str],
     report: Report,
@@ -349,12 +396,12 @@ def check_scores(
     require_keys(
         scores,
         ("image_id", "seed", "scores", "generated_image_sha256", "prompt_sha256"),
-        path,
-        report,
+        path, report,
     )
     if scores.get("image_id") != expected_image:
         report.add("E_SCORES_IMAGE_MISMATCH", path,
-                   f"image_id {scores.get('image_id')!r} != directory image_id {expected_image!r}")
+                   f"image_id {scores.get('image_id')!r} != "
+                   f"directory image_id {expected_image!r}")
 
     seed_val = scores.get("seed")
     if expect_seed is not None:
@@ -400,7 +447,7 @@ def check_scores(
 
 def check_aggregate(
     aggregate: dict,
-    path: Path,
+    path: Any,
     run_id: str,
     split: str | None,
     image_ids: list[str],
@@ -412,8 +459,7 @@ def check_aggregate(
     require_keys(
         aggregate,
         ("run_id", "split", "n_images", "seeds", "means", "composite", "composite_unweighted"),
-        path,
-        report,
+        path, report,
     )
     if aggregate.get("run_id") != run_id:
         report.add("E_AGG_RUN_MISMATCH", path,
@@ -422,11 +468,9 @@ def check_aggregate(
         report.add("E_AGG_SPLIT_MISMATCH", path,
                    f"split {aggregate.get('split')!r} != run split {split!r}")
     if aggregate.get("n_images") != len(image_ids):
-        report.add(
-            "E_AGG_N_IMAGES",
-            path,
-            f"n_images {aggregate.get('n_images')!r} != len(image_ids) {len(image_ids)!r}",
-        )
+        report.add("E_AGG_N_IMAGES", path,
+                   f"n_images {aggregate.get('n_images')!r} "
+                   f"!= len(image_ids) {len(image_ids)!r}")
 
     means = aggregate.get("means")
     if not isinstance(means, dict):
@@ -443,30 +487,24 @@ def check_aggregate(
             continue
         observed = per_image_means.get(m) or []
         if len(observed) != len(image_ids):
-            # Already reported elsewhere; skip mean comparison.
             continue
         expected = sum(observed) / len(observed) if observed else 0.0
         if not approx_equal(v, expected):
-            report.add(
-                "E_AGG_MISMATCH",
-                path,
-                f"means[{m!r}] = {v} disagrees with per-image mean {expected:.6f}",
-            )
+            report.add("E_AGG_MISMATCH", path,
+                       f"means[{m!r}] = {v} disagrees with per-image mean {expected:.6f}")
 
     composite_unweighted = aggregate.get("composite_unweighted")
     if isinstance(composite_unweighted, (int, float)) and isinstance(means, dict) and metrics:
         recomputed = sum(float(means[m]) for m in metrics if m in means) / len(metrics)
         if not approx_equal(composite_unweighted, recomputed):
-            report.add(
-                "E_COMPOSITE_FORMULA",
-                path,
-                f"composite_unweighted {composite_unweighted} != mean of means {recomputed:.6f}",
-            )
+            report.add("E_COMPOSITE_FORMULA", path,
+                       f"composite_unweighted {composite_unweighted} "
+                       f"!= mean of means {recomputed:.6f}")
 
 
 def check_gate(
     gate: dict,
-    path: Path,
+    path: Any,
     aggregate: dict,
     metrics: list[str],
     report: Report,
@@ -474,25 +512,25 @@ def check_gate(
     require_schema_version(gate, path, report)
     require_keys(
         gate,
-        (
-            "leader_run_id", "candidate_means", "candidate_composite",
-            "regression_epsilon", "no_regression", "improves_composite",
-            "single_run_gate", "decision",
-        ),
-        path,
-        report,
+        ("leader_run_id", "candidate_means", "candidate_composite",
+         "regression_epsilon", "no_regression", "improves_composite",
+         "single_run_gate", "decision"),
+        path, report,
     )
 
     decision = gate.get("decision")
     if decision not in GATE_DECISIONS:
-        report.add("E_GATE_DECISION", path, f"decision {decision!r} not in {sorted(GATE_DECISIONS)}")
+        report.add("E_GATE_DECISION", path,
+                   f"decision {decision!r} not in {sorted(GATE_DECISIONS)}")
 
     single = gate.get("single_run_gate")
     if single not in GATE_OUTCOMES:
-        report.add("E_GATE_OUTCOME", path, f"single_run_gate {single!r} not in {sorted(GATE_OUTCOMES)}")
+        report.add("E_GATE_OUTCOME", path,
+                   f"single_run_gate {single!r} not in {sorted(GATE_OUTCOMES)}")
     three = gate.get("three_seed_gate")
     if three is not None and three not in GATE_OUTCOMES:
-        report.add("E_GATE_OUTCOME", path, f"three_seed_gate {three!r} not in {sorted(GATE_OUTCOMES)} or null")
+        report.add("E_GATE_OUTCOME", path,
+                   f"three_seed_gate {three!r} not in {sorted(GATE_OUTCOMES)} or null")
 
     cand_means = gate.get("candidate_means")
     if not isinstance(cand_means, dict):
@@ -505,9 +543,9 @@ def check_gate(
             if m in cand_means and m in agg_means:
                 if not approx_equal(cand_means[m], agg_means[m]):
                     report.add(
-                        "E_GATE_AGG_MISMATCH",
-                        path,
-                        f"candidate_means[{m!r}] {cand_means[m]} != aggregate means {agg_means[m]}",
+                        "E_GATE_AGG_MISMATCH", path,
+                        f"candidate_means[{m!r}] {cand_means[m]} "
+                        f"!= aggregate means {agg_means[m]}",
                     )
 
     epsilon = gate.get("regression_epsilon")
@@ -515,20 +553,15 @@ def check_gate(
     leader_means = gate.get("leader_means")
     if leader_run_id is None:
         if decision != "no_leader":
-            report.add(
-                "E_GATE_NO_LEADER_DECISION",
-                path,
-                f"first run must use decision='no_leader', got {decision!r}",
-            )
+            report.add("E_GATE_NO_LEADER_DECISION", path,
+                       f"first run must use decision='no_leader', got {decision!r}")
         if gate.get("no_regression") is not True or gate.get("improves_composite") is not True:
-            report.add(
-                "E_GATE_NO_LEADER_FLAGS",
-                path,
-                "first run must set no_regression=true and improves_composite=true",
-            )
+            report.add("E_GATE_NO_LEADER_FLAGS", path,
+                       "first run must set no_regression=true and improves_composite=true")
     else:
         if not isinstance(leader_means, dict):
-            report.add("E_GATE_LEADER_MEANS", path, "leader_means must be an object when leader_run_id is set")
+            report.add("E_GATE_LEADER_MEANS", path,
+                       "leader_means must be an object when leader_run_id is set")
         elif isinstance(epsilon, (int, float)):
             expected_no_regression = all(
                 m in cand_means and m in leader_means
@@ -536,99 +569,97 @@ def check_gate(
                 for m in metrics
             )
             if bool(gate.get("no_regression")) != expected_no_regression:
-                report.add(
-                    "E_GATE_NO_REGRESSION",
-                    path,
-                    f"no_regression={gate.get('no_regression')} disagrees with computed {expected_no_regression}",
-                )
+                report.add("E_GATE_NO_REGRESSION", path,
+                           f"no_regression={gate.get('no_regression')} "
+                           f"disagrees with computed {expected_no_regression}")
         leader_comp = gate.get("leader_composite")
         cand_comp = gate.get("candidate_composite")
         if isinstance(leader_comp, (int, float)) and isinstance(cand_comp, (int, float)):
             expected_improves = float(cand_comp) > float(leader_comp)
             if bool(gate.get("improves_composite")) != expected_improves:
-                report.add(
-                    "E_GATE_IMPROVES",
-                    path,
-                    f"improves_composite={gate.get('improves_composite')} disagrees with computed {expected_improves}",
-                )
+                report.add("E_GATE_IMPROVES", path,
+                           f"improves_composite={gate.get('improves_composite')} "
+                           f"disagrees with computed {expected_improves}")
 
 
 # --------------------------- leader ---------------------------
 
 
-def check_leader(root: Path, report: Report, run_ids: set[str]) -> None:
-    pointer_path = root / "experiments" / "leader" / "pointer.json"
-    history_path = root / "experiments" / "leader" / "history.jsonl"
+def check_leader(backend: Backend, report: Report, run_ids: set[str]) -> None:
+    pointer_rel = "experiments/leader/pointer.json"
+    history_rel = "experiments/leader/history.jsonl"
+    pointer_disp = backend.format_path(pointer_rel)
+    history_disp = backend.format_path(history_rel)
 
-    pointer = load_json(pointer_path, report) if pointer_path.exists() else None
-    if pointer is None and not history_path.exists():
-        # No leader yet — acceptable for a fresh repo.
-        return
+    pointer_present = backend.is_file(pointer_rel)
+    history_present = backend.is_file(history_rel)
+    if not pointer_present and not history_present:
+        return  # no leader yet — acceptable for a fresh repo
 
-    if pointer is not None:
-        if not isinstance(pointer, dict):
-            report.add("E_LEADER_POINTER_SHAPE", pointer_path, "pointer.json must be an object")
-            pointer = None
+    pointer: dict | None = None
+    if pointer_present:
+        loaded = load_json(backend, pointer_rel, report)
+        if not isinstance(loaded, dict):
+            if loaded is not None:
+                report.add("E_LEADER_POINTER_SHAPE", pointer_disp,
+                           "pointer.json must be an object")
         else:
-            require_schema_version(pointer, pointer_path, report)
-            require_keys(pointer, ("run_id", "composite", "means", "promoted_at"), pointer_path, report)
+            pointer = loaded
+            require_schema_version(pointer, pointer_disp, report)
+            require_keys(pointer, ("run_id", "composite", "means", "promoted_at"),
+                         pointer_disp, report)
             ptr_run = pointer.get("run_id")
             if ptr_run is not None and ptr_run not in run_ids:
-                report.add(
-                    "E_LEADER_RUN_MISSING",
-                    pointer_path,
-                    f"pointer.run_id {ptr_run!r} has no matching run directory",
-                )
+                report.add("E_LEADER_RUN_MISSING", pointer_disp,
+                           f"pointer.run_id {ptr_run!r} has no matching run directory")
 
     history_lines: list[dict] = []
-    if history_path.exists():
+    if history_present:
+        try:
+            history_text = backend.read_text(history_rel)
+        except Exception as exc:
+            report.add("E_HISTORY_JSON", history_disp, f"could not read: {exc}")
+            history_text = ""
         report.files_checked += 1
-        with history_path.open("r", encoding="utf-8") as f:
-            for lineno, raw in enumerate(f, start=1):
-                if not raw.strip():
-                    continue
-                try:
-                    obj = json.loads(raw)
-                except json.JSONDecodeError as exc:
-                    report.add("E_HISTORY_JSON", history_path, f"line {lineno}: invalid JSON ({exc})")
-                    continue
-                if not isinstance(obj, dict):
-                    report.add("E_HISTORY_SHAPE", history_path, f"line {lineno}: not an object")
-                    continue
-                if not all(k in obj for k in ("run_id", "composite", "promoted_at", "previous_run_id")):
-                    report.add("E_HISTORY_FIELDS", history_path, f"line {lineno}: missing required fields")
-                    continue
-                if obj["run_id"] not in run_ids:
-                    report.add(
-                        "E_HISTORY_RUN_MISSING",
-                        history_path,
-                        f"line {lineno}: run_id {obj['run_id']!r} has no matching run directory",
-                    )
-                history_lines.append(obj)
+        for lineno, raw in enumerate(history_text.splitlines(), start=1):
+            if not raw.strip():
+                continue
+            try:
+                obj = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                report.add("E_HISTORY_JSON", history_disp,
+                           f"line {lineno}: invalid JSON ({exc})")
+                continue
+            if not isinstance(obj, dict):
+                report.add("E_HISTORY_SHAPE", history_disp, f"line {lineno}: not an object")
+                continue
+            if not all(k in obj for k in ("run_id", "composite", "promoted_at", "previous_run_id")):
+                report.add("E_HISTORY_FIELDS", history_disp,
+                           f"line {lineno}: missing required fields")
+                continue
+            if obj["run_id"] not in run_ids:
+                report.add("E_HISTORY_RUN_MISSING", history_disp,
+                           f"line {lineno}: run_id {obj['run_id']!r} "
+                           f"has no matching run directory")
+            history_lines.append(obj)
 
         for i in range(1, len(history_lines)):
             if history_lines[i]["previous_run_id"] != history_lines[i - 1]["run_id"]:
-                report.add(
-                    "E_HISTORY_CHAIN",
-                    history_path,
-                    f"line {i + 1}: previous_run_id does not point to prior leader",
-                )
+                report.add("E_HISTORY_CHAIN", history_disp,
+                           f"line {i + 1}: previous_run_id does not point to prior leader")
 
     if pointer and history_lines:
         last = history_lines[-1]
         if last["run_id"] != pointer.get("run_id"):
-            report.add(
-                "E_LEADER_POINTER_HISTORY",
-                pointer_path,
-                f"pointer.run_id {pointer.get('run_id')!r} != last history run_id {last['run_id']!r}",
-            )
-        if isinstance(last.get("composite"), (int, float)) and isinstance(pointer.get("composite"), (int, float)):
+            report.add("E_LEADER_POINTER_HISTORY", pointer_disp,
+                       f"pointer.run_id {pointer.get('run_id')!r} "
+                       f"!= last history run_id {last['run_id']!r}")
+        if isinstance(last.get("composite"), (int, float)) \
+                and isinstance(pointer.get("composite"), (int, float)):
             if not approx_equal(last["composite"], pointer["composite"]):
-                report.add(
-                    "E_LEADER_COMPOSITE",
-                    pointer_path,
-                    f"pointer.composite {pointer['composite']} != last history composite {last['composite']}",
-                )
+                report.add("E_LEADER_COMPOSITE", pointer_disp,
+                           f"pointer.composite {pointer['composite']} "
+                           f"!= last history composite {last['composite']}")
 
 
 # --------------------------- logbook ---------------------------
@@ -651,74 +682,95 @@ LOGBOOK_RE = re.compile(
 )
 
 
-def check_logbook(root: Path, report: Report, run_ids: set[str]) -> None:
-    path = root / "experiments" / "logbook.md"
-    if not path.exists():
-        report.add("E_FILE_MISSING", path, "logbook.md missing")
+def check_logbook(backend: Backend, report: Report, run_ids: set[str]) -> None:
+    rel = "experiments/logbook.md"
+    disp = backend.format_path(rel)
+    if not backend.is_file(rel):
+        report.add("E_FILE_MISSING", disp, "logbook.md missing")
         return
     report.files_checked += 1
-    text = path.read_text(encoding="utf-8")
+    try:
+        text = backend.read_text(rel)
+    except Exception as exc:
+        report.add("E_FILE_MISSING", disp, f"could not read: {exc}")
+        return
     matches = list(LOGBOOK_RE.finditer(text))
     seen: set[str] = set()
     for m in matches:
         rid = m.group("run_id")
         if rid in seen:
-            report.add("E_LOGBOOK_DUPLICATE", path, f"run_id {rid!r} appears more than once")
+            report.add("E_LOGBOOK_DUPLICATE", disp,
+                       f"run_id {rid!r} appears more than once")
         seen.add(rid)
         if rid not in run_ids:
-            report.add(
-                "E_LOGBOOK_RUN_MISSING",
-                path,
-                f"logbook entry {rid!r} has no matching run directory",
-            )
+            report.add("E_LOGBOOK_RUN_MISSING", disp,
+                       f"logbook entry {rid!r} has no matching run directory")
     for rid in run_ids - seen:
-        report.add("E_LOGBOOK_ENTRY_MISSING", path, f"run {rid!r} has no logbook entry")
+        report.add("E_LOGBOOK_ENTRY_MISSING", disp,
+                   f"run {rid!r} has no logbook entry")
 
 
 # --------------------------- entry point ---------------------------
 
 
-def check_root(root: Path, verify_hashes: bool) -> Report:
+def check_root(root: Backend | Path | str, verify_hashes: bool) -> Report:
+    """Validate the repo at `root`.
+
+    `root` may be:
+      - a `Backend` instance (used as-is, e.g. for tests with a fake)
+      - a `pathlib.Path` (treated as a local directory)
+      - a `str`: either a local path or a `gs://bucket/prefix` URI
+    """
+    if isinstance(root, Backend):
+        backend = root
+    else:
+        backend = make_backend(root)
+
     report = Report()
 
-    for required in (
-        root / "eval_data" / "images",
-        root / "experiments" / "runs",
-    ):
-        if not required.is_dir():
-            report.add("E_FILE_MISSING", required, "required directory missing")
+    for required in ("eval_data/images", "experiments/runs"):
+        if not backend.is_dir(required):
+            report.add("E_FILE_MISSING", backend.format_path(required),
+                       "required directory missing")
 
-    manifest_by_split = check_manifest(root, report, verify_hashes)
+    manifest_by_split = check_manifest(backend, report, verify_hashes)
 
-    runs_dir = root / "experiments" / "runs"
+    runs_rel = "experiments/runs"
     run_ids: set[str] = set()
-    if runs_dir.is_dir():
-        for run_dir in sorted(p for p in runs_dir.iterdir() if p.is_dir()):
-            result = check_run(run_dir, report, manifest_by_split, verify_hashes)
+    if backend.is_dir(runs_rel):
+        subdirs, _ = backend.list_dir(runs_rel)
+        for child in sorted(subdirs, key=lambda s: s["name"]):
+            result = check_run(backend, child["path"], report,
+                               manifest_by_split, verify_hashes)
             if result is not None:
-                run_ids.add(run_dir.name)
+                run_ids.add(child["name"])
 
-    check_leader(root, report, run_ids)
-    if (root / "experiments" / "logbook.md").exists() or run_ids:
-        check_logbook(root, report, run_ids)
+    check_leader(backend, report, run_ids)
+    if backend.is_file("experiments/logbook.md") or run_ids:
+        check_logbook(backend, report, run_ids)
 
     return report
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--root", type=Path, required=True, help="repo root to validate")
+    parser.add_argument("--root", required=True,
+                        help="repo root: local directory or gs://bucket/prefix")
     parser.add_argument("--verify-hashes", action="store_true",
                         help="recompute sha256 of every image referenced in the manifest")
-    parser.add_argument("--json", action="store_true", help="emit machine-readable JSON output")
+    parser.add_argument("--json", action="store_true",
+                        help="emit machine-readable JSON output")
+    parser.add_argument("--gcs-cache-ttl", type=float, default=30.0,
+                        help="seconds to cache GCS metadata listings (default: 30)")
     args = parser.parse_args(argv)
 
-    root = args.root.resolve()
-    if not root.is_dir():
-        print(f"E_ROOT_MISSING {root}: not a directory", file=sys.stderr)
+    try:
+        backend = make_backend(args.root, gcs_cache_ttl=args.gcs_cache_ttl)
+    except (FileNotFoundError, ValueError, ImportError) as exc:
+        print(f"E_ROOT_MISSING {args.root}: {exc}", file=sys.stderr)
         return 1
 
-    report = check_root(root, args.verify_hashes)
+    report = check_root(backend, args.verify_hashes)
 
     if args.json:
         out = {

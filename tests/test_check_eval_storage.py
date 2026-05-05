@@ -1012,5 +1012,170 @@ class MainCliTests(unittest.TestCase):
         self.assertEqual(rc_bad, 1)
 
 
+# --------------------------- GCS backend ---------------------------
+
+
+from tests._gcs_stub import install_fake_storage  # noqa: E402
+
+# Inject the fake before importing the backend module that lazily imports
+# google.cloud.storage. The viewer tests already trigger this, but we call
+# install explicitly to be order-independent.
+_FAKE_CLIENT = install_fake_storage()
+
+
+def _seed_bucket_from_local(bucket, src: Path, prefix: str) -> int:
+    """Mirror every file under `src` to `bucket` under `prefix/`."""
+    count = 0
+    for path in src.rglob("*"):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(src).as_posix()
+        obj = f"{prefix.strip('/')}/{rel}" if prefix.strip("/") else rel
+        bucket.blobs[obj] = path.read_bytes()
+        count += 1
+    return count
+
+
+class GcsCheckerTests(unittest.TestCase):
+    """Validate the checker over a GCS-backed root using the fake stub."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.local = Path(self._tmp.name)
+        _build_valid_eval_repo(self.local)
+        _FAKE_CLIENT._buckets.clear()
+        self.bucket = _FAKE_CLIENT.bucket("checker-bucket")
+        n = _seed_bucket_from_local(self.bucket, self.local, prefix="mirror")
+        self.assertGreater(n, 0)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+        _FAKE_CLIENT._buckets.clear()
+
+    def _check(self, verify_hashes: bool = False) -> check_eval_storage.Report:
+        return check_eval_storage.check_root(
+            "gs://checker-bucket/mirror", verify_hashes=verify_hashes)
+
+    def test_valid_gcs_root_passes(self) -> None:
+        report = self._check()
+        self.assertTrue(
+            report.ok,
+            msg=[(v.code, v.path, v.message) for v in report.violations],
+        )
+
+    def test_violation_paths_use_gs_uri(self) -> None:
+        # Provoke any violation, then check the path field is a gs:// URL.
+        manifest_obj = "mirror/eval_data/images/manifest.json"
+        manifest_text = self.bucket.blobs[manifest_obj].decode("utf-8")
+        broken = manifest_text.replace('"schema_version": "1.0.0"',
+                                        '"schema_version": "0.0.0"', 1)
+        self.bucket.blobs[manifest_obj] = broken.encode("utf-8")
+        report = self._check()
+        codes = [v.code for v in report.violations]
+        self.assertIn("E_SCHEMA_VERSION", codes)
+        # All violation paths should be gs:// URIs, not local paths.
+        for v in report.violations:
+            self.assertTrue(
+                v.path.startswith("gs://checker-bucket/"),
+                msg=f"violation path {v.path!r} is not a gs:// URI",
+            )
+
+    def test_score_violation_through_gcs(self) -> None:
+        scores_obj = (
+            f"mirror/experiments/runs/{RUN_ID}/per_image/{IMAGE_ID}/scores.json")
+        text = self.bucket.blobs[scores_obj].decode("utf-8")
+        data = json.loads(text)
+        data["scores"]["s_gemini"] = 1.5
+        self.bucket.blobs[scores_obj] = json.dumps(data).encode("utf-8")
+        report = self._check()
+        codes = [v.code for v in report.violations]
+        self.assertIn("E_SCORES_RANGE", codes)
+
+    def test_hash_verification_through_gcs(self) -> None:
+        # Replace the image bytes; recorded sha256 in manifest should mismatch.
+        img_obj = f"mirror/eval_data/images/train/{IMAGE_ID}.png"
+        self.bucket.blobs[img_obj] = b"different image bytes"
+        report = self._check(verify_hashes=True)
+        codes = [v.code for v in report.violations]
+        self.assertIn("E_IMAGE_HASH_MISMATCH", codes)
+
+    def test_check_root_accepts_backend_instance(self) -> None:
+        from storage_backend import GCSBackend
+        backend = GCSBackend("checker-bucket", "mirror")
+        report = check_eval_storage.check_root(backend, verify_hashes=False)
+        self.assertTrue(report.ok)
+
+    def test_main_with_gcs_root(self) -> None:
+        # CLI: --root gs://... should validate and exit 0 on a clean repo.
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            rc = check_eval_storage.main([
+                "--root", "gs://checker-bucket/mirror",
+            ])
+        self.assertEqual(rc, 0)
+
+    def test_main_with_gcs_root_violation(self) -> None:
+        # Break the bucket; CLI should exit 1.
+        scores_obj = (
+            f"mirror/experiments/runs/{RUN_ID}/per_image/{IMAGE_ID}/scores.json")
+        text = self.bucket.blobs[scores_obj].decode("utf-8")
+        data = json.loads(text)
+        data["scores"]["s_gemini"] = -0.1
+        self.bucket.blobs[scores_obj] = json.dumps(data).encode("utf-8")
+        out = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(io.StringIO()):
+            rc = check_eval_storage.main([
+                "--root", "gs://checker-bucket/mirror", "--json",
+            ])
+        self.assertEqual(rc, 1)
+        payload = json.loads(out.getvalue())
+        self.assertFalse(payload["ok"])
+        self.assertIn("E_SCORES_RANGE",
+                      {v["code"] for v in payload["violations"]})
+
+
+class GcsCheckerNoPrefixTests(unittest.TestCase):
+    """Same checker against a bucket with no prefix."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.local = Path(self._tmp.name)
+        _build_valid_eval_repo(self.local)
+        _FAKE_CLIENT._buckets.clear()
+        self.bucket = _FAKE_CLIENT.bucket("checker-rootbucket")
+        _seed_bucket_from_local(self.bucket, self.local, prefix="")
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+        _FAKE_CLIENT._buckets.clear()
+
+    def test_no_prefix_root_passes(self) -> None:
+        report = check_eval_storage.check_root(
+            "gs://checker-rootbucket", verify_hashes=False)
+        self.assertTrue(
+            report.ok,
+            msg=[(v.code, v.path, v.message) for v in report.violations],
+        )
+
+
+class CheckRootTypeDispatchTests(unittest.TestCase):
+    """check_root() accepts Path, str, or Backend."""
+
+    def test_accepts_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _build_valid_eval_repo(root)
+            self.assertTrue(check_eval_storage.check_root(root, verify_hashes=False).ok)
+
+    def test_accepts_str_local(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _build_valid_eval_repo(Path(tmp))
+            self.assertTrue(
+                check_eval_storage.check_root(tmp, verify_hashes=False).ok)
+
+    def test_rejects_bad_gs_uri(self) -> None:
+        with self.assertRaises(ValueError):
+            check_eval_storage.check_root("gs:///nope", verify_hashes=False)
+
+
 if __name__ == "__main__":
     unittest.main()
