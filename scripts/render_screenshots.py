@@ -1,0 +1,368 @@
+"""Render PNG screenshots of the viewer's three views without a browser.
+
+Uses the viewer's /api/inspect endpoint to get the live data, builds a
+static HTML version (mirroring the SPA's renderers in Python), then
+renders via weasyprint -> PDF -> PNG through pypdfium2.
+
+Usage:
+    python view_eval_results.py --root /tmp/demo-fixture --port 8780 &
+    python scripts/render_screenshots.py --base http://127.0.0.1:8780 --out docs/screenshots
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import html
+import json
+import sys
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+CSS = """
+:root {
+  --fg: #1a1a1a; --muted: #666; --bg: #fafafa; --panel: #fff;
+  --border: #e5e5e5; --accent: #2257d6; --good: #1f8f3a; --bad: #c83232;
+}
+* { box-sizing: border-box; }
+body { margin: 0; font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; color: var(--fg); background: var(--bg); }
+.layout { display: flex; min-height: 100%; }
+.sidebar { width: 320px; min-width: 320px; background: var(--panel); border-right: 1px solid var(--border); padding: 14px; }
+.main { flex: 1; padding: 18px 22px; }
+.bc { font-size: 13px; margin-bottom: 14px; word-break: break-all; }
+.bc a { color: var(--accent); text-decoration: none; }
+.bc .sep { color: var(--muted); margin: 0 4px; }
+ul.dirlist { list-style: none; padding: 0; margin: 0; }
+ul.dirlist li { padding: 6px 6px; border-bottom: 1px solid #f1f1f1; display: flex; align-items: center; }
+ul.dirlist a { color: var(--fg); text-decoration: none; flex: 1; word-break: break-all; }
+.badge { font-size: 11px; padding: 1px 6px; border-radius: 9px; background: #eef2ff; color: var(--accent); margin-left: 6px; }
+.badge.run { background: #e8f5ec; color: var(--good); }
+.badge.exps { background: #fff4e0; color: #b76b00; }
+.hint { color: var(--muted); font-style: italic; }
+h2 { margin: 0 0 6px 0; font-size: 18px; }
+h3 { margin: 22px 0 8px 0; font-size: 15px; }
+h4 { margin: 0 0 6px 0; font-size: 13px; word-break: break-all; }
+table { border-collapse: collapse; width: 100%; background: var(--panel); border: 1px solid var(--border); }
+th, td { padding: 8px 10px; border-bottom: 1px solid var(--border); text-align: left; vertical-align: top; font-size: 12.5px; }
+th { background: #f5f6f9; font-weight: 600; }
+tr:hover { background: #f5f8ff; }
+td.composite { font-weight: 600; font-variant-numeric: tabular-nums; }
+td.metric { font-family: ui-monospace, "SFMono-Regular", Menlo, monospace; font-size: 12px; color: #333; }
+.meta-row { color: var(--muted); font-size: 13px; margin: 4px 0; }
+.meta-row b { color: var(--fg); }
+.meta-row code { background: #f1f3f7; padding: 1px 5px; border-radius: 3px; font-size: 12px; }
+.grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 14px; }
+.card { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 12px; }
+.pair { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 6px 0; }
+figure { margin: 0; text-align: center; }
+figure img { max-width: 100%; max-height: 160px; border: 1px solid var(--border); border-radius: 4px; background: #f5f5f5; }
+figure figcaption { font-size: 11px; color: var(--muted); margin-top: 2px; }
+.scores { font-family: ui-monospace, "SFMono-Regular", Menlo, monospace; font-size: 11.5px; margin: 6px 0; word-break: break-all; }
+.pill { display: inline-block; padding: 1px 8px; border-radius: 9px; font-size: 11px; }
+.pill.promoted { background: #e8f5ec; color: var(--good); }
+.pill.rejected { background: #fdecec; color: var(--bad); }
+.pill.reverted { background: #fff4e0; color: #b76b00; }
+.pill.no_leader { background: #eef2ff; color: var(--accent); }
+.pill.fail { background: #fdecec; color: var(--bad); }
+.pill.pass { background: #e8f5ec; color: var(--good); }
+.heading { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 4px; }
+.heading code { background: #f1f3f7; padding: 1px 5px; border-radius: 3px; font-size: 12px; }
+"""
+
+
+def get_json(base: str, path: str) -> dict:
+    url = f"{base}/api/inspect?path={urllib.parse.quote(path)}"
+    with urllib.request.urlopen(url) as resp:
+        return json.loads(resp.read())
+
+
+def get_image_data_uri(base: str, api_url: str | None) -> str | None:
+    if not api_url:
+        return None
+    full = f"{base}{api_url}"
+    try:
+        with urllib.request.urlopen(full) as resp:
+            data = resp.read()
+            ctype = resp.headers.get("Content-Type", "image/png")
+    except Exception:
+        return None
+    return f"data:{ctype};base64,{base64.b64encode(data).decode('ascii')}"
+
+
+def fmt(n, d=4):
+    if n is None or not isinstance(n, (int, float)):
+        return "—"
+    return f"{n:.{d}f}"
+
+
+def esc(s):
+    return html.escape("" if s is None else str(s), quote=True)
+
+
+def render_breadcrumb(d):
+    parts = []
+    for i, b in enumerate(d["breadcrumb"]):
+        if i > 0:
+            parts.append('<span class="sep">/</span>')
+        parts.append(f'<a>{esc(b["name"])}</a>')
+    return f'<div class="bc">{"".join(parts)}</div>'
+
+
+def render_sidebar(d):
+    items = []
+    for s in d.get("subdirs", []):
+        kind = s.get("kind", "")
+        cls = "run" if kind == "run" else ("exps" if kind == "runs_container" else "")
+        label = "run" if kind == "run" else ("experiments" if kind == "runs_container" else "")
+        badge = f'<span class="badge {cls}">{esc(label)}</span>' if label else ""
+        items.append(f'<li><a>{esc(s["name"])}</a>{badge}</li>')
+    if not items:
+        listing = '<p class="hint">(no subdirectories)</p>'
+    else:
+        listing = f'<ul class="dirlist">{"".join(items)}</ul>'
+    return f'<aside class="sidebar">{render_breadcrumb(d)}{listing}</aside>'
+
+
+def decision_pill(decision):
+    if not decision:
+        return ""
+    cls = {"promoted": "promoted", "rejected": "rejected",
+           "reverted_after_reeval": "reverted",
+           "no_leader": "no_leader"}.get(decision, "")
+    label = "reverted" if decision == "reverted_after_reeval" else decision
+    return f'<span class="pill {cls}">{esc(label)}</span>'
+
+
+def gate_pill(g):
+    if not g:
+        return ""
+    cls = "pass" if g == "pass" else ("fail" if g == "fail" else "")
+    return f'<span class="pill {cls}">{esc(g)}</span>'
+
+
+def render_scores_inline(scores):
+    if not scores:
+        return '<span class="hint">no scores</span>'
+    parts = [f"{esc(k)}=<b>{fmt(v, 3)}</b>" for k, v in scores.items()]
+    return " · ".join(parts)
+
+
+def metric_columns(rows):
+    keys = []
+    seen = set()
+    for r in rows:
+        for k in (r.get("means") or {}):
+            if k not in seen:
+                seen.add(k)
+                keys.append(k)
+    return sorted(keys)
+
+
+def render_summary(d):
+    rows = d.get("summary") or []
+    cols = metric_columns(rows)
+    title = (
+        f'<h2>{esc(d.get("path") or d.get("root_name"))} '
+        f'<span style="color:var(--muted);font-weight:400;">— '
+        f'{len(rows)} run{"" if len(rows)==1 else "s"}</span></h2>'
+    )
+    if not rows:
+        return f'<main class="main">{title}<p class="hint">No runs.</p></main>'
+    head_cells = (
+        '<th>run_id</th><th>driver</th><th>split</th><th>status</th><th>started</th>'
+        '<th>composite</th>' +
+        "".join(f'<th>{esc(k)}</th>' for k in cols) +
+        '<th>gate</th><th>decision</th>'
+    )
+    body_rows = []
+    for r in rows:
+        cells = [
+            f'<td>{esc(r["run_id"])}</td>',
+            f'<td>{esc(r.get("driver") or "")}</td>',
+            f'<td>{esc(r.get("split") or "")}</td>',
+            f'<td>{esc(r.get("status") or "")}</td>',
+            f'<td>{esc(r.get("started_at") or "")}</td>',
+            f'<td class="composite">{fmt(r.get("composite"), 4)}</td>',
+        ]
+        means = r.get("means") or {}
+        for k in cols:
+            cells.append(f'<td class="metric">{fmt(means.get(k), 3)}</td>')
+        cells.append(f'<td>{gate_pill(r.get("single_run_gate"))}</td>')
+        cells.append(f'<td>{decision_pill(r.get("decision"))}</td>')
+        body_rows.append(f'<tr>{"".join(cells)}</tr>')
+    table = (
+        f'<table><thead><tr>{head_cells}</tr></thead>'
+        f'<tbody>{"".join(body_rows)}</tbody></table>'
+    )
+    return f'<main class="main">{title}{table}</main>'
+
+
+def render_run(d, base):
+    rd = d.get("run_detail") or {}
+    run = rd.get("run") or {}
+    agg = rd.get("aggregate") or {}
+    gate = rd.get("gate") or {}
+    out = []
+    out.append('<main class="main">')
+    out.append(
+        '<div class="heading">'
+        f'<h2>{esc(run.get("run_id") or "(unnamed)")}</h2>'
+        f'{decision_pill(gate.get("decision"))}'
+        f'{gate_pill(gate.get("single_run_gate"))}'
+        '</div>'
+    )
+    out.append(
+        '<p class="meta-row">'
+        f'<b>{esc(run.get("driver") or "?")}</b> · '
+        f'harness=<code>{esc(run.get("harness_variant") or "?")}</code> · '
+        f'split=<code>{esc(run.get("split") or "?")}</code> · '
+        f'seeds=<code>{esc(json.dumps(run.get("seeds") or []))}</code> · '
+        f'status=<b>{esc(run.get("status") or "?")}</b>'
+        '</p>'
+    )
+    out.append(
+        '<p class="meta-row">'
+        f'composite=<b>{fmt(agg.get("composite"), 4)}</b>'
+        f'{(" · means: " + render_scores_inline(agg.get("means") or {}))}'
+        '</p>'
+    )
+    if run.get("hypothesis"):
+        out.append(f'<p class="meta-row"><i>{esc(run["hypothesis"])}</i></p>')
+    if run.get("takeaway"):
+        out.append(f'<p class="meta-row">→ {esc(run["takeaway"])}</p>')
+
+    images = rd.get("images") or []
+    out.append(f'<h3>Per-image ({len(images)})</h3>')
+    out.append('<div class="grid">')
+    for img in images:
+        target_data = get_image_data_uri(base, img.get("target_url"))
+        gen_data = get_image_data_uri(base, img.get("generated_url"))
+        target_html = (
+            f'<img src="{target_data}" alt="target">' if target_data
+            else '<div style="height:140px;display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:12px;">target unavailable</div>'
+        )
+        gen_html = (
+            f'<img src="{gen_data}" alt="generated">' if gen_data
+            else '<div style="height:140px;display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:12px;">no generated.png</div>'
+        )
+        out.append(
+            f'<div class="card"><h4>{esc(img["image_id"])}</h4>'
+            '<div class="pair">'
+            f'<figure>{target_html}<figcaption>target</figcaption></figure>'
+            f'<figure>{gen_html}<figcaption>generated</figcaption></figure>'
+            '</div>'
+            f'<div class="scores">{render_scores_inline(img.get("scores") or {})}</div>'
+            '</div>'
+        )
+    out.append('</div>')
+    out.append('</main>')
+    return "".join(out)
+
+
+def render_browser(d):
+    here = d.get("path") or d.get("root_name")
+    children = d.get("subdirs") or []
+    exps = [c for c in children if c.get("kind") == "runs_container"]
+    runs = [c for c in children if c.get("kind") == "run"]
+    msg = "Pick a subdirectory in the sidebar."
+    if exps:
+        names = ", ".join(esc(c["name"]) for c in exps)
+        msg += (f" This folder has <b>{len(exps)}</b> experiment "
+                f"folder{'' if len(exps)==1 else 's'}: {names}.")
+    elif runs:
+        msg += f" This folder has <b>{len(runs)}</b> run folder{'' if len(runs)==1 else 's'}."
+    return f'<main class="main"><h2>{esc(here)}</h2><p class="hint">{msg}</p></main>'
+
+
+def page(body_inner: str, width_css: str = "1280px", height_css: str = "1200px") -> str:
+    return f"""<!doctype html>
+<html><head><meta charset='utf-8'>
+<style>{CSS}
+@page {{ size: {width_css} {height_css}; margin: 0; }}
+.layout {{ width: {width_css}; min-height: {height_css}; }}
+</style></head>
+<body><div class="layout">{body_inner}</div></body></html>
+"""
+
+
+def _trim_to_content(img, margin: int = 36, threshold: int = 235, sample_step: int = 6):
+    """Crop trailing whitespace below the last row containing any 'content' pixel.
+
+    Detects content as any pixel darker than `threshold` after converting to
+    grayscale. This works for both the white sidebar (text on #fff) and the
+    grey main pane (text/borders on #fafafa), since all text/borders are
+    materially darker than either bg.
+    """
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    w, h = img.size
+    gray = img.convert("L")
+    pixels = gray.load()
+    last_row = -1
+    for y in range(h - 1, -1, -1):
+        for x in range(0, w, sample_step):
+            if pixels[x, y] < threshold:
+                last_row = y
+                break
+        if last_row >= 0:
+            break
+    if last_row < 0:
+        return img
+    return img.crop((0, 0, w, min(h, last_row + margin)))
+
+
+def render_to_png(html_text: str, out_path: Path, width_css: str = "1280px",
+                  height_css: str = "1100px") -> None:
+    from weasyprint import HTML
+    import pypdfium2 as pdfium
+    page_size_css = f"@page {{ size: {width_css} {height_css}; margin: 0; }}"
+    html_with_page = html_text.replace("@page { size:", page_size_css + " /*")
+    # Re-inject by simple replace was clumsy; build cleanly instead.
+    html_with_page = html_text  # the caller already set @page in CSS via page().
+    pdf_bytes = HTML(string=html_with_page).write_pdf()
+    pdf = pdfium.PdfDocument(pdf_bytes)
+    img = pdf[0].render(scale=2.0).to_pil()
+    img = _trim_to_content(img)
+    img.save(out_path, "PNG", optimize=True)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--base", default="http://127.0.0.1:8765",
+                        help="viewer base URL (default: http://127.0.0.1:8765)")
+    parser.add_argument("--out", type=Path, required=True,
+                        help="directory to write PNGs into")
+    args = parser.parse_args(argv)
+    out = args.out
+    out.mkdir(parents=True, exist_ok=True)
+
+    # 1) Top-level browser view (root dir)
+    root_data = get_json(args.base, "")
+    sidebar = render_sidebar(root_data)
+    browser_main = render_browser(root_data)
+    render_to_png(page(sidebar + browser_main, "1280px", "600px"),
+                  out / "01-browser.png", "1280px", "600px")
+    print(f"wrote {out / '01-browser.png'}", file=sys.stderr)
+
+    # 2) Summary table for experiments/runs
+    runs_data = get_json(args.base, "experiments/runs")
+    sidebar = render_sidebar(runs_data)
+    summary_main = render_summary(runs_data)
+    render_to_png(page(sidebar + summary_main, "1600px", "650px"),
+                  out / "02-summary.png", "1600px", "650px")
+    print(f"wrote {out / '02-summary.png'}", file=sys.stderr)
+
+    # 3) Run detail for the leader (palette step)
+    run_path = "experiments/runs/20260504T112800Z__claude-opus-4-7__add_palette_step"
+    detail_data = get_json(args.base, run_path)
+    sidebar = render_sidebar(detail_data)
+    detail_main = render_run(detail_data, args.base)
+    render_to_png(page(sidebar + detail_main, "1500px", "900px"),
+                  out / "03-run-detail.png", "1500px", "900px")
+    print(f"wrote {out / '03-run-detail.png'}", file=sys.stderr)
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
