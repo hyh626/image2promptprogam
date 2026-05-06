@@ -7,6 +7,24 @@ The harness has already been implemented when this document is used by the
 research/driver agent. The driver edits `prompt.txt`, runs the harness, reads
 the score trajectory, and decides whether to continue, restart, or stop.
 
+## Variance-Control Evaluation Rule
+
+For every target image/task, future implementation agents should avoid drawing
+conclusions from one VLM caption and one generated image. Recent variance
+studies found that robust evaluation should use nested sampling:
+
+1. Generate **M >= 3 independent VLM captions/decompositions** of the target
+   image.
+2. For **each** caption/prompt, generate **N >= 2 independent images** with
+   distinct generation seeds.
+3. Score all `M × N` generated images against the target. Aggregate per caption
+   and across captions, and record both mean score and variance.
+4. Promote or report a prompt only when the averaged M-by-N result is robust.
+
+Single-caption or single-generation runs are acceptable only as smoke tests for
+plumbing and must be labeled as such. Confirm any apparent winner with at least
+3 VLM captions and 2 generations per caption before treating it as evidence.
+
 ## Canonical Data Storage
 
 `EVAL_STORAGE_SCHEMA.md` is authoritative for on-disk data and run artifacts.
@@ -37,9 +55,10 @@ can pass after eval artifacts exist.
    python main.py --iterations 100
    ```
 
-The harness generates images, scores each generation against the canonical
-target image, keeps prompt changes that improve the aggregate score, and
-reverts prompt changes that regress.
+The harness should generate at least three independent VLM captions per target
+and at least two generated images per caption, score every generation against
+the canonical target image, keep prompt changes that improve the aggregate
+M-by-N score, and revert prompt changes that regress.
 
 ## Artifacts
 
