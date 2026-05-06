@@ -333,6 +333,66 @@ class ViewBuildersTests(unittest.TestCase):
         self.assertEqual(data["kind"], "run")
         self.assertIn("run_detail", data)
 
+    def test_runs_container_uses_precomputed_index_when_present(self) -> None:
+        # Drop a synthetic _index.json into experiments/runs and prove the
+        # viewer reads it instead of walking per_image/scores.json. We
+        # encode a marker in the index that could not have come from a
+        # real walk (a synthetic "marker_score" composite) and assert it
+        # surfaces verbatim in the response.
+        idx = {
+            "schema_version": "1.0.0",
+            "generated_at": "2026-05-06T00:00:00Z",
+            "runs": [{
+                "run_id": RUN_ID,
+                "path": "experiments/runs/" + RUN_ID,
+                "name": "from-index",
+                "driver": "indexed-driver",
+                "harness_variant": "opus4.7",
+                "split": "eval",
+                "started_at": "2026-05-04T12:34:56Z",
+                "status": "completed",
+                "image_ids": [IMAGE_ID],
+                "n_images": 1,
+                "means": {m: 0.9 for m in METRICS},
+                "composite": 0.9123,
+                "composite_unweighted": 0.9123,
+                "decision": "promoted",
+                "single_run_gate": "pass",
+                "three_seed_gate": None,
+                "cells": {
+                    IMAGE_ID: {
+                        "scores": {m: 0.9 for m in METRICS},
+                        "judge": None,
+                        "has_generated": True,
+                    }
+                },
+            }],
+        }
+        (self.root / "experiments" / "runs" / "_index.json").write_text(
+            json.dumps(idx), encoding="utf-8")
+        data = v.inspect_dir("experiments/runs")
+        self.assertTrue(data["has_index"])
+        self.assertEqual(data["index_generated_at"], "2026-05-06T00:00:00Z")
+        # Summary fields propagated from the synthetic index, not from disk.
+        self.assertEqual(data["summary"][0]["composite"], 0.9123)
+        self.assertEqual(data["summary"][0]["driver"], "indexed-driver")
+        self.assertEqual(data["summary"][0]["decision"], "promoted")
+        # Timeline cells too.
+        cell = data["timeline"]["cells"][IMAGE_ID][RUN_ID]
+        self.assertEqual(cell["composite"], 0.9123)
+        self.assertEqual(cell["decision"], "promoted")
+        self.assertTrue(cell["generated_url"].endswith(
+            f"per_image/{IMAGE_ID}/generated.png"))
+        # And the file list must hide the internal index file.
+        files = [f["name"] for f in data["files"]]
+        self.assertNotIn("_index.json", files)
+
+    def test_runs_container_without_index_falls_back_to_walk(self) -> None:
+        # The minimal fixture has no _index.json; viewer must still work.
+        data = v.inspect_dir("experiments/runs")
+        self.assertFalse(data["has_index"])
+        self.assertEqual(data["summary"][0]["composite"], 0.5)
+
     def test_inspect_dir_breadcrumb(self) -> None:
         data = v.inspect_dir("experiments/runs/" + RUN_ID)
         bc_paths = [b["path"] for b in data["breadcrumb"]]

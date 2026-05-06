@@ -52,6 +52,12 @@ class FakeBlob:
         with open(path, "rb") as f:
             self._bucket.blobs[self.name] = f.read()
 
+    def upload_from_string(self, data, content_type: str | None = None,
+                           client=None) -> None:
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        self._bucket.blobs[self.name] = data
+
     def open(self, mode: str):
         if mode != "rb":
             raise ValueError(f"only 'rb' supported, got {mode!r}")

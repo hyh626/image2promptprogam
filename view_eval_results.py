@@ -40,6 +40,12 @@ from storage_backend import (  # noqa: F401  re-exported for tests/back-compat
 
 BACKEND: Backend  # set in main()
 
+# Precomputed summary file written by sync_runs_to_gcs.py at
+# `<runs_container>/_index.json`. The viewer prefers it over walking
+# every run on the bucket; absent, it falls back to the slow per-run
+# walk (current behaviour).
+RUNS_INDEX_FILENAME = "_index.json"
+
 
 # --------------------------- view builders ---------------------------
 
@@ -112,33 +118,87 @@ def breadcrumb(rel: str) -> list[dict[str, str]]:
     return out
 
 
-def build_summary(container_rel: str) -> list[dict[str, Any]]:
+def load_runs_index(container_rel: str) -> dict | None:
+    """Read `<container_rel>/_index.json` if present, else None.
+
+    The file is produced by `sync_runs_to_gcs.py` and lets us render
+    Summary + Timeline without fanning out N×M metadata reads for every
+    page load. Best-effort: any read/parse failure falls through to the
+    slow walk path.
+    """
+    rel = (
+        f"{container_rel}/{RUNS_INDEX_FILENAME}" if container_rel
+        else RUNS_INDEX_FILENAME
+    )
+    if not BACKEND.is_file(rel):
+        return None
+    try:
+        data = json.loads(BACKEND.read_text(rel))
+    except Exception:
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("runs"), list):
+        return None
+    return data
+
+
+def _summary_row_from_index(entry: dict[str, Any], container_rel: str) -> dict[str, Any]:
+    rid = entry.get("run_id") or ""
+    path = entry.get("path") or (
+        f"{container_rel}/{rid}" if container_rel else rid
+    )
+    return {
+        "run_id": rid,
+        "path": path,
+        "driver": entry.get("driver"),
+        "name": entry.get("name"),
+        "status": entry.get("status"),
+        "started_at": entry.get("started_at"),
+        "harness_variant": entry.get("harness_variant"),
+        "split": entry.get("split"),
+        "n_images": entry.get("n_images") or len(entry.get("image_ids") or []),
+        "composite": entry.get("composite"),
+        "composite_unweighted": entry.get("composite_unweighted"),
+        "means": entry.get("means") or {},
+        "decision": entry.get("decision"),
+        "single_run_gate": entry.get("single_run_gate"),
+        "three_seed_gate": entry.get("three_seed_gate"),
+    }
+
+
+def build_summary(container_rel: str, *, index: dict | None = None) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    subdirs, _ = BACKEND.list_dir(container_rel)
-    for child in subdirs:
-        run_json_path = f"{child['path']}/run.json"
-        if not BACKEND.is_file(run_json_path):
-            continue
-        run = safe_load_json(run_json_path) or {}
-        agg = safe_load_json(f"{child['path']}/aggregate.json") or {}
-        gate = safe_load_json(f"{child['path']}/gate.json") or {}
-        rows.append({
-            "run_id": child["name"],
-            "path": child["path"],
-            "driver": run.get("driver"),
-            "name": run.get("name"),
-            "status": run.get("status"),
-            "started_at": run.get("started_at"),
-            "harness_variant": run.get("harness_variant"),
-            "split": run.get("split"),
-            "n_images": agg.get("n_images") or len(run.get("image_ids") or []),
-            "composite": agg.get("composite"),
-            "composite_unweighted": agg.get("composite_unweighted"),
-            "means": agg.get("means") or {},
-            "decision": gate.get("decision"),
-            "single_run_gate": gate.get("single_run_gate"),
-            "three_seed_gate": gate.get("three_seed_gate"),
-        })
+    if index is None:
+        index = load_runs_index(container_rel)
+
+    if index is not None:
+        for entry in index.get("runs") or []:
+            rows.append(_summary_row_from_index(entry, container_rel))
+    else:
+        subdirs, _ = BACKEND.list_dir(container_rel)
+        for child in subdirs:
+            run_json_path = f"{child['path']}/run.json"
+            if not BACKEND.is_file(run_json_path):
+                continue
+            run = safe_load_json(run_json_path) or {}
+            agg = safe_load_json(f"{child['path']}/aggregate.json") or {}
+            gate = safe_load_json(f"{child['path']}/gate.json") or {}
+            rows.append({
+                "run_id": child["name"],
+                "path": child["path"],
+                "driver": run.get("driver"),
+                "name": run.get("name"),
+                "status": run.get("status"),
+                "started_at": run.get("started_at"),
+                "harness_variant": run.get("harness_variant"),
+                "split": run.get("split"),
+                "n_images": agg.get("n_images") or len(run.get("image_ids") or []),
+                "composite": agg.get("composite"),
+                "composite_unweighted": agg.get("composite_unweighted"),
+                "means": agg.get("means") or {},
+                "decision": gate.get("decision"),
+                "single_run_gate": gate.get("single_run_gate"),
+                "three_seed_gate": gate.get("three_seed_gate"),
+            })
     rows.sort(
         key=lambda r: (
             -(r.get("composite") if isinstance(r.get("composite"), (int, float)) else -1),
@@ -148,7 +208,7 @@ def build_summary(container_rel: str) -> list[dict[str, Any]]:
     return rows
 
 
-def build_timeline(container_rel: str) -> dict[str, Any]:
+def build_timeline(container_rel: str, *, index: dict | None = None) -> dict[str, Any]:
     """Per-image evolution across all runs under `container_rel`.
 
     Returns a structure suitable for rendering a pivot grid:
@@ -165,50 +225,95 @@ def build_timeline(container_rel: str) -> dict[str, Any]:
           }
         }
     """
-    subdirs, _ = BACKEND.list_dir(container_rel)
     runs: list[dict[str, Any]] = []
     cells: dict[str, dict[str, dict[str, Any]]] = {}
     image_ids: list[str] = []
     seen_images: set[str] = set()
 
-    # Gather one entry per run (those with run.json)
-    for child in subdirs:
-        run_json_rel = f"{child['path']}/run.json"
-        if not BACKEND.is_file(run_json_rel):
-            continue
-        run = safe_load_json(run_json_rel) or {}
-        agg = safe_load_json(f"{child['path']}/aggregate.json") or {}
-        gate = safe_load_json(f"{child['path']}/gate.json") or {}
-        runs.append({
-            "run_id": child["name"],
-            "path": child["path"],
-            "name": run.get("name"),
-            "driver": run.get("driver"),
-            "split": run.get("split"),
-            "started_at": run.get("started_at"),
-            "decision": gate.get("decision"),
-            "single_run_gate": gate.get("single_run_gate"),
-            "composite": agg.get("composite"),
-            "is_leader_promotion": gate.get("decision") in ("promoted", "no_leader"),
-            "hypothesis": run.get("hypothesis"),
-        })
+    if index is None:
+        index = load_runs_index(container_rel)
 
-        for image_id in run.get("image_ids") or []:
-            if image_id not in seen_images:
-                seen_images.add(image_id)
-                image_ids.append(image_id)
-            img_dir = f"{child['path']}/per_image/{image_id}"
-            scores_doc = safe_load_json(f"{img_dir}/scores.json") or {}
-            gen_path = f"{img_dir}/generated.png"
-            cell: dict[str, Any] = {
-                "scores": scores_doc.get("scores") or {},
+    if index is not None:
+        # Fast path: everything we need is in `_index.json`. No per-run
+        # is_file/list_dir calls — useful on GCS where each is a HEAD.
+        for entry in index.get("runs") or []:
+            rid = entry.get("run_id") or ""
+            path = entry.get("path") or (
+                f"{container_rel}/{rid}" if container_rel else rid
+            )
+            decision = entry.get("decision")
+            composite = entry.get("composite")
+            runs.append({
+                "run_id": rid,
+                "path": path,
+                "name": entry.get("name"),
+                "driver": entry.get("driver"),
+                "split": entry.get("split"),
+                "started_at": entry.get("started_at"),
+                "decision": decision,
+                "single_run_gate": entry.get("single_run_gate"),
+                "composite": composite,
+                "is_leader_promotion": decision in ("promoted", "no_leader"),
+                "hypothesis": entry.get("hypothesis"),
+            })
+
+            entry_cells = entry.get("cells") or {}
+            for image_id in entry.get("image_ids") or []:
+                if image_id not in seen_images:
+                    seen_images.add(image_id)
+                    image_ids.append(image_id)
+                cinfo = entry_cells.get(image_id) or {}
+                cell: dict[str, Any] = {
+                    "scores": cinfo.get("scores") or {},
+                    "decision": decision,
+                    "single_run_gate": entry.get("single_run_gate"),
+                    "composite": composite,
+                }
+                if cinfo.get("has_generated"):
+                    cell["generated_url"] = (
+                        "/api/file?path="
+                        + urllib.parse.quote(f"{path}/per_image/{image_id}/generated.png")
+                    )
+                cells.setdefault(image_id, {})[rid] = cell
+    else:
+        subdirs, _ = BACKEND.list_dir(container_rel)
+        for child in subdirs:
+            run_json_rel = f"{child['path']}/run.json"
+            if not BACKEND.is_file(run_json_rel):
+                continue
+            run = safe_load_json(run_json_rel) or {}
+            agg = safe_load_json(f"{child['path']}/aggregate.json") or {}
+            gate = safe_load_json(f"{child['path']}/gate.json") or {}
+            runs.append({
+                "run_id": child["name"],
+                "path": child["path"],
+                "name": run.get("name"),
+                "driver": run.get("driver"),
+                "split": run.get("split"),
+                "started_at": run.get("started_at"),
                 "decision": gate.get("decision"),
                 "single_run_gate": gate.get("single_run_gate"),
                 "composite": agg.get("composite"),
-            }
-            if BACKEND.is_file(gen_path):
-                cell["generated_url"] = "/api/file?path=" + urllib.parse.quote(gen_path)
-            cells.setdefault(image_id, {})[child["name"]] = cell
+                "is_leader_promotion": gate.get("decision") in ("promoted", "no_leader"),
+                "hypothesis": run.get("hypothesis"),
+            })
+
+            for image_id in run.get("image_ids") or []:
+                if image_id not in seen_images:
+                    seen_images.add(image_id)
+                    image_ids.append(image_id)
+                img_dir = f"{child['path']}/per_image/{image_id}"
+                scores_doc = safe_load_json(f"{img_dir}/scores.json") or {}
+                gen_path = f"{img_dir}/generated.png"
+                cell: dict[str, Any] = {
+                    "scores": scores_doc.get("scores") or {},
+                    "decision": gate.get("decision"),
+                    "single_run_gate": gate.get("single_run_gate"),
+                    "composite": agg.get("composite"),
+                }
+                if BACKEND.is_file(gen_path):
+                    cell["generated_url"] = "/api/file?path=" + urllib.parse.quote(gen_path)
+                cells.setdefault(image_id, {})[child["name"]] = cell
 
     # Sort runs chronologically (oldest first; promotion order reads naturally).
     runs.sort(key=lambda r: r.get("started_at") or "")
@@ -318,6 +423,11 @@ def inspect_dir(rel: str) -> dict[str, Any]:
     kind = classify_dir(rel)
     subdirs, files = BACKEND.list_dir(rel)
 
+    # Hide internal viewer files (currently `_index.json`) from the
+    # sidebar's file list. The browser doesn't navigate into files
+    # anyway, but the underscore prefix is a clear "system" signal.
+    files = [f for f in files if not f["name"].startswith("_")]
+
     enriched_subdirs: list[dict] = []
     for s in subdirs:
         if BACKEND.is_file(f"{s['path']}/run.json"):
@@ -340,8 +450,12 @@ def inspect_dir(rel: str) -> dict[str, Any]:
         "root_name": BACKEND.root_label or "/",
     }
     if kind == "runs_container":
-        result["summary"] = build_summary(rel)
-        result["timeline"] = build_timeline(rel)
+        index = load_runs_index(rel)
+        result["has_index"] = index is not None
+        if index is not None and index.get("generated_at"):
+            result["index_generated_at"] = index.get("generated_at")
+        result["summary"] = build_summary(rel, index=index)
+        result["timeline"] = build_timeline(rel, index=index)
     elif kind == "run":
         result["run_detail"] = build_run_detail(rel)
     return result
@@ -362,9 +476,12 @@ INDEX_HTML = r"""<!doctype html>
   }
   * { box-sizing: border-box; }
   body { margin: 0; font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; color: var(--fg); background: var(--bg); }
-  .layout { display: grid; grid-template-columns: 320px 1fr; height: 100vh; }
+  /* `minmax(0, 1fr)` lets the main column shrink past its content and
+     keeps wide tables (e.g. timeline with many runs) inside the
+     viewport instead of stretching the layout grid. */
+  .layout { display: grid; grid-template-columns: 320px minmax(0, 1fr); height: 100vh; }
   .sidebar { background: var(--panel); border-right: 1px solid var(--border); overflow-y: auto; padding: 12px; }
-  .main { padding: 18px 22px; overflow-y: auto; }
+  .main { padding: 18px 22px; overflow-y: auto; min-width: 0; }
   .bc { font-size: 13px; margin-bottom: 14px; word-break: break-all; }
   .bc a { color: var(--accent); text-decoration: none; }
   .bc a:hover { text-decoration: underline; }
@@ -416,8 +533,11 @@ INDEX_HTML = r"""<!doctype html>
   .tabs .tab { background: none; border: 1px solid transparent; border-bottom: none; padding: 6px 12px; font-size: 13px; cursor: pointer; color: var(--muted); border-radius: 4px 4px 0 0; }
   .tabs .tab.active { color: var(--fg); border-color: var(--border); background: var(--panel); margin-bottom: -1px; }
   .tabs .tab:hover { color: var(--fg); }
-  .timeline-wrap { overflow: auto; max-width: 100%; }
-  table.timeline { border-collapse: separate; border-spacing: 0; background: var(--panel); border: 1px solid var(--border); }
+  /* The earlier `table { width: 100% }` rule would squeeze cells until
+     no horizontal scrollbar ever appeared. Force the timeline table to
+     its content width instead, and let the wrap scroll horizontally. */
+  .timeline-wrap { overflow-x: auto; overflow-y: visible; max-width: 100%; }
+  table.timeline { width: max-content; min-width: 100%; border-collapse: separate; border-spacing: 0; background: var(--panel); border: 1px solid var(--border); }
   table.timeline th, table.timeline td { padding: 6px 8px; border-bottom: 1px solid var(--border); border-right: 1px solid var(--border); vertical-align: top; }
   table.timeline thead th { background: #f5f6f9; font-size: 12px; text-align: left; }
   table.timeline tbody th { text-align: left; font-weight: 600; font-size: 12.5px; min-width: 160px; max-width: 220px; word-break: break-word; }
@@ -437,6 +557,16 @@ INDEX_HTML = r"""<!doctype html>
   .tscores .pos { color: var(--good); }
   .tscores .neg { color: var(--bad); }
   .tcell-target-head, .tcell-img-head { background: #f0f2f7; }
+  .toolrow { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin: 0 0 10px 0; padding: 8px 10px; background: var(--panel); border: 1px solid var(--border); border-radius: 4px; }
+  .toolrow label { font-size: 12.5px; color: var(--fg); display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
+  .toolrow .stat { font-size: 12px; color: var(--muted); }
+  .toolrow .stat b { color: var(--fg); }
+  .pager { display: inline-flex; align-items: center; gap: 6px; }
+  .pager button { font-size: 12px; padding: 3px 9px; border: 1px solid var(--border); background: var(--panel); border-radius: 3px; cursor: pointer; color: var(--fg); }
+  .pager button:hover:not(:disabled) { background: #f1f3f7; }
+  .pager button:disabled { opacity: 0.5; cursor: default; }
+  .pager .pageinfo { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .index-badge { font-size: 11px; color: var(--muted); }
 </style>
 </head>
 <body>
@@ -528,6 +658,17 @@ function setTab(tab) {
   history.replaceState({path}, '', newHash);
 }
 
+// Page state for the runs-container views. `showRejected` defaults to
+// false so a flurry of failed candidates does not drown out the
+// promoted leader chain on first load. Persisted across re-renders for
+// the lifetime of the page.
+const TIMELINE_PAGE_SIZE = 12;
+const RUNS_VIEW = {
+  showRejected: false,
+  timelinePage: 0,
+};
+function isRejected(decision) { return decision === 'rejected'; }
+
 function renderMain(d) {
   if (d.kind === 'run') return renderRun(d.run_detail || {});
   if (d.kind === 'runs_container') return renderRunsContainer(d);
@@ -542,11 +683,55 @@ function renderRunsContainer(d) {
     `<div class="tabs">${tabBtn('summary', 'Summary')}` +
     `${tabBtn('timeline', 'Timeline')}` +
     `${tabBtn('leader-only', 'Leader chain')}</div>`;
+
+  const toolRow = renderToolRow(d, tab);
   let body;
   if (tab === 'timeline') body = renderTimeline(d.timeline || {}, false);
   else if (tab === 'leader-only') body = renderTimeline(d.timeline || {}, true);
   else body = renderSummary(d);
-  return tabs + body;
+  return tabs + toolRow + body;
+}
+
+function renderToolRow(d, tab) {
+  const summary = d.summary || [];
+  const timelineRuns = (d.timeline && d.timeline.runs) || [];
+  const totalRuns = tab === 'summary' ? summary.length : timelineRuns.length;
+  const rejectedCount = (tab === 'summary' ? summary : timelineRuns)
+    .filter(r => isRejected(r.decision)).length;
+
+  const indexBadge = d.has_index
+    ? `<span class="index-badge" title="Loaded from precomputed _index.json${d.index_generated_at ? ' generated ' + escapeHtml(d.index_generated_at) : ''}">indexed</span>`
+    : '<span class="index-badge" title="No _index.json on this prefix; the viewer walked every run. Re-run sync_runs_to_gcs.py to write one.">unindexed</span>';
+
+  let pager = '';
+  if (tab !== 'summary') {
+    // Pagination is only needed for the column-heavy timeline grid.
+    const visible = filteredTimelineRuns(d.timeline || {}, tab === 'leader-only').length;
+    const pageCount = Math.max(1, Math.ceil(visible / TIMELINE_PAGE_SIZE));
+    if (RUNS_VIEW.timelinePage >= pageCount) RUNS_VIEW.timelinePage = pageCount - 1;
+    if (RUNS_VIEW.timelinePage < 0) RUNS_VIEW.timelinePage = 0;
+    const page = RUNS_VIEW.timelinePage;
+    const from = visible === 0 ? 0 : page * TIMELINE_PAGE_SIZE + 1;
+    const to = Math.min(visible, (page + 1) * TIMELINE_PAGE_SIZE);
+    pager = `<span class="pager">
+      <button data-page-delta="-1" ${page === 0 ? 'disabled' : ''}>‹ prev</button>
+      <span class="pageinfo">runs ${from}–${to} of ${visible}</span>
+      <button data-page-delta="1" ${page >= pageCount - 1 ? 'disabled' : ''}>next ›</button>
+    </span>`;
+  }
+
+  const stat = `<span class="stat">${totalRuns} run${totalRuns === 1 ? '' : 's'}` +
+    (rejectedCount ? ` · <b>${rejectedCount}</b> rejected` : '') +
+    `</span>`;
+  const checkbox = `<label><input type="checkbox" data-toggle-rejected ${RUNS_VIEW.showRejected ? 'checked' : ''}> show rejected</label>`;
+  return `<div class="toolrow">${checkbox}${stat}${pager}${indexBadge}</div>`;
+}
+
+function filteredTimelineRuns(t, leaderOnly) {
+  let runs = t.runs || [];
+  if (leaderOnly) runs = runs.filter(r => r.is_leader_promotion);
+  if (!RUNS_VIEW.showRejected) runs = runs.filter(r => !isRejected(r.decision));
+  return runs;
 }
 
 function renderPlainDir(d) {
@@ -590,8 +775,10 @@ function metricCols(rows) {
 }
 
 function renderSummary(d) {
-  const rows = d.summary || [];
-  let html = `<h2>${escapeHtml(d.path || d.root_name)} <span style="color:var(--muted);font-weight:400;">— ${rows.length} run${rows.length === 1 ? '' : 's'}</span></h2>`;
+  const all = d.summary || [];
+  const rows = RUNS_VIEW.showRejected ? all : all.filter(r => !isRejected(r.decision));
+  const hidden = all.length - rows.length;
+  let html = `<h2>${escapeHtml(d.path || d.root_name)} <span style="color:var(--muted);font-weight:400;">— ${rows.length} run${rows.length === 1 ? '' : 's'}${hidden ? ` (+${hidden} rejected hidden)` : ''}</span></h2>`;
   if (!rows.length) return html + '<p class="empty">No runs found in this folder.</p>';
 
   const cols = metricCols(rows);
@@ -632,20 +819,30 @@ function renderJudge(judge) {
 
 function renderTimeline(t, leaderOnly) {
   const allRuns = t.runs || [];
-  const runs = leaderOnly ? allRuns.filter(r => r.is_leader_promotion) : allRuns;
+  const filtered = filteredTimelineRuns(t, leaderOnly);
+  const totalPages = Math.max(1, Math.ceil(filtered.length / TIMELINE_PAGE_SIZE));
+  if (RUNS_VIEW.timelinePage >= totalPages) RUNS_VIEW.timelinePage = totalPages - 1;
+  if (RUNS_VIEW.timelinePage < 0) RUNS_VIEW.timelinePage = 0;
+  const start = RUNS_VIEW.timelinePage * TIMELINE_PAGE_SIZE;
+  const runs = filtered.slice(start, start + TIMELINE_PAGE_SIZE);
   const imageIds = t.image_ids || [];
   const cells = t.cells || {};
   const manifest = t.manifest || {};
 
+  const hidden = allRuns.length - filtered.length;
   const subtitle = leaderOnly
-    ? `Leader chain — ${runs.length} promoted run${runs.length === 1 ? '' : 's'}, ${imageIds.length} image${imageIds.length === 1 ? '' : 's'}`
-    : `All runs — ${runs.length} run${runs.length === 1 ? '' : 's'}, ${imageIds.length} image${imageIds.length === 1 ? '' : 's'}`;
+    ? `Leader chain — ${filtered.length} promoted run${filtered.length === 1 ? '' : 's'}, ${imageIds.length} image${imageIds.length === 1 ? '' : 's'}`
+    : `All runs — ${filtered.length} run${filtered.length === 1 ? '' : 's'}, ${imageIds.length} image${imageIds.length === 1 ? '' : 's'}`;
 
-  if (!runs.length || !imageIds.length) {
-    return `<p class="hint">${escapeHtml(subtitle)}</p><p class="empty">Nothing to compare yet.</p>`;
+  if (!filtered.length || !imageIds.length) {
+    const empty = hidden
+      ? `Nothing matches the current filter (${hidden} rejected hidden — toggle "show rejected" above).`
+      : 'Nothing to compare yet.';
+    return `<p class="hint">${escapeHtml(subtitle)}</p><p class="empty">${escapeHtml(empty)}</p>`;
   }
 
-  let html = `<p class="meta-row">${escapeHtml(subtitle)}. Images on the rows, runs on the columns (left = oldest).</p>`;
+  const hiddenSuffix = hidden ? ` · <b>${hidden}</b> rejected hidden` : '';
+  let html = `<p class="meta-row">${escapeHtml(subtitle)}${hiddenSuffix ? ' (' + hiddenSuffix.replace(/<[^>]+>/g, '') + ')' : ''}. Images on the rows, runs on the columns (left = oldest).</p>`;
   html += '<div class="timeline-wrap"><table class="timeline">';
   // Header row: "image" + per-run columns
   html += '<thead><tr><th class="tcell-img-head">image</th><th class="tcell-target-head">target</th>';
@@ -783,7 +980,16 @@ document.addEventListener('click', (e) => {
   if (tabBtn) {
     e.preventDefault();
     setTab(tabBtn.getAttribute('data-tab'));
-    // re-render without re-fetching: re-use the last loaded data on the page.
+    // Reset pagination when crossing tabs; the run set may be a
+    // different size and "page 5" can become out-of-range.
+    RUNS_VIEW.timelinePage = 0;
+    if (window.__lastData) render(window.__lastData);
+    return;
+  }
+  const pageBtn = e.target.closest('[data-page-delta]');
+  if (pageBtn && !pageBtn.disabled) {
+    e.preventDefault();
+    RUNS_VIEW.timelinePage += Number(pageBtn.getAttribute('data-page-delta')) || 0;
     if (window.__lastData) render(window.__lastData);
     return;
   }
@@ -793,6 +999,14 @@ document.addEventListener('click', (e) => {
   const path = a.getAttribute('data-path');
   history.pushState({path}, '', '#' + encodeURIComponent(path));
   loadPath(path);
+});
+
+document.addEventListener('change', (e) => {
+  const cb = e.target.closest('[data-toggle-rejected]');
+  if (!cb) return;
+  RUNS_VIEW.showRejected = !!cb.checked;
+  RUNS_VIEW.timelinePage = 0;
+  if (window.__lastData) render(window.__lastData);
 });
 
 window.addEventListener('popstate', () => {

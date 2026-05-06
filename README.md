@@ -81,6 +81,11 @@ the previous shown run. Promoted columns tint green, rejected ones tint red.
 
 ![timeline](docs/screenshots/04-timeline.png)
 
+By default rejected runs are hidden — the toolbar above the tabs has a
+**show rejected** checkbox that brings them back. The Timeline grid
+paginates large run lists so wide bucket histories scroll horizontally
+within a manageable number of columns.
+
 A **Leader chain** tab filters the same view to runs whose decision is
 `promoted` or `no_leader`, so only the surviving leader trajectory remains
 on screen.
@@ -120,6 +125,18 @@ Pass `--allow-unauthenticated` to publish a public URL. The script
 prints the service URL on success, plus a sample
 `Authorization: Bearer …` curl when the service is private.
 
+For a browser-friendly login flow, pass `--iap` to turn on Cloud Run's
+built-in Identity-Aware Proxy and `--iap-member` (repeatable) to grant
+specific users or groups `roles/iap.httpsResourceAccessor`. Members can
+then open the URL directly after a Google sign-in:
+
+```bash
+./scripts/deploy_cloud_run.sh ... \
+  --iap \
+  --iap-member user:alice@example.com \
+  --iap-member group:eng@example.com
+```
+
 Configuration env vars the container reads:
 
 | Env var               | Purpose                                                    |
@@ -129,6 +146,13 @@ Configuration env vars the container reads:
 | `VIEWER_HOST`         | Bind address; the image defaults to `0.0.0.0`              |
 | `VIEWER_GCS_ONLY`     | When `1`, refuse local roots; the image sets this default  |
 | `VIEWER_GCS_CACHE_TTL`| Seconds to cache GCS metadata listings (default `30`)      |
+
+`sync_runs_to_gcs.py` writes an `experiments/runs/_index.json` summary
+to the bucket at the end of every sync. The viewer prefers it for
+Summary and Timeline rendering, which avoids walking N×M metadata
+objects on each page load. The viewer falls back to the per-run walk
+if the file is missing, so older buckets keep working — re-run sync to
+get the speedup. Pass `--no-index` to suppress writing it.
 
 ## Data
 

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import io
+import json
 import sys
 import tempfile
 import unittest
@@ -276,6 +277,81 @@ class RunPlanTests(unittest.TestCase):
         self.assertEqual(plan.uploads, [])
         self.assertGreater(len(plan.skips), 0)
         self.assertEqual(self.bucket.blobs, first_blobs)
+
+
+class RunsIndexTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        build_minimal_repo(self.root)
+        _FAKE_CLIENT._buckets.clear()
+        self.bucket = _FAKE_CLIENT.bucket("test-bucket")
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+        _FAKE_CLIENT._buckets.clear()
+
+    def test_build_runs_index_basic(self) -> None:
+        idx = s.build_runs_index(self.root)
+        self.assertIsNotNone(idx)
+        self.assertEqual(len(idx["runs"]), 1)
+        entry = idx["runs"][0]
+        self.assertEqual(entry["run_id"], RUN_ID)
+        self.assertEqual(entry["composite"], 0.5)
+        self.assertEqual(entry["decision"], "no_leader")
+        # Cells include the per-image scores read from scores.json.
+        self.assertIn("hero_photo_01", entry["cells"])
+        self.assertTrue(entry["cells"]["hero_photo_01"]["has_generated"])
+
+    def test_main_uploads_index(self) -> None:
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            rc = s.main([
+                "--src", str(self.root),
+                "--dst", "gs://test-bucket/mirror",
+                "--quiet",
+            ])
+        self.assertEqual(rc, 0)
+        body = self.bucket.blobs.get("mirror/experiments/runs/_index.json")
+        self.assertIsNotNone(body, "viewer index should be uploaded")
+        idx = json.loads(body.decode("utf-8"))
+        self.assertEqual(len(idx["runs"]), 1)
+        self.assertEqual(idx["runs"][0]["run_id"], RUN_ID)
+
+    def test_main_no_index_flag_skips_index(self) -> None:
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            rc = s.main([
+                "--src", str(self.root),
+                "--dst", "gs://test-bucket/mirror",
+                "--quiet", "--no-index",
+            ])
+        self.assertEqual(rc, 0)
+        self.assertNotIn("mirror/experiments/runs/_index.json", self.bucket.blobs)
+
+    def test_run_scoped_index_merges_with_remote(self) -> None:
+        # Pretend the bucket already has an index for an OTHER run that is
+        # NOT on disk locally. A run-scoped sync that only touches RUN_ID
+        # must keep the OTHER entry instead of dropping it.
+        existing = {
+            "schema_version": "1.0.0",
+            "generated_at": "2026-04-01T00:00:00Z",
+            "runs": [{"run_id": "OTHER", "path": "experiments/runs/OTHER",
+                      "composite": 0.42, "decision": "rejected",
+                      "image_ids": [], "cells": {}}],
+        }
+        self.bucket.blobs["mirror/experiments/runs/_index.json"] = (
+            json.dumps(existing).encode("utf-8"))
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            rc = s.main([
+                "--src", str(self.root),
+                "--dst", "gs://test-bucket/mirror",
+                "--runs", RUN_ID,
+                "--quiet",
+            ])
+        self.assertEqual(rc, 0)
+        body = self.bucket.blobs["mirror/experiments/runs/_index.json"]
+        idx = json.loads(body.decode("utf-8"))
+        ids = sorted(r["run_id"] for r in idx["runs"])
+        self.assertEqual(ids, sorted([RUN_ID, "OTHER"]))
 
 
 if __name__ == "__main__":
