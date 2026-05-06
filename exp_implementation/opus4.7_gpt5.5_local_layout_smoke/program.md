@@ -69,6 +69,28 @@ generations, decomposition into subject/style/composition fields,
 few-shot examples, thinking levels, etc. The function may make
 multiple API calls internally.
 
+## Variance-control best practice
+
+Recent variance studies showed that single VLM captions and single image
+generations are too noisy for reliable prompt evaluation. For every target
+image/task, use a nested sampling plan unless you are doing a throwaway
+smoke test:
+
+1. Make **M >= 3 independent VLM caption/decomposition calls** for the same
+   target image. Vary only sampling randomness or analysis focus; do not
+   change the fixed generator or scoring stack.
+2. For **each** caption/prompt candidate, run **N >= 2 independent image
+   generations** with distinct seeds.
+3. Score all `M × N` generated images, aggregate per caption first, then
+   compare candidates by mean score and score variance.
+4. Promote or report a strategy only when the averaged result is robust; do
+   not trust a single lucky caption or generation.
+
+This increases cost, but it substantially reduces VLM-caption variance and
+image-generator seed noise. If budget forces a smaller exploratory run, label
+it as a smoke/debug run and confirm any apparent winner with the M-by-N plan
+before treating it as evidence.
+
 ## Running an experiment
 
 ```bash
@@ -194,10 +216,11 @@ prompts). Diversity is a goal, not a side effect.
 
 ## Budget guardrails
 
-- **Per experiment:** 30 input images × your VLM calls per image, plus
-  30 generations and 120 local feature extractions. If your strategy
-  needs more than ~5 VLM calls per image, the gain has to be
-  substantial to justify it.
+- **Per experiment:** baseline evals should budget for 30 input images ×
+  M VLM captions (M >= 3) × N image generations per caption (N >= 2),
+  plus local feature extraction for every generated image. If your strategy
+  needs more than ~5 VLM calls per image or more than ~3 generations per
+  caption, the gain has to be substantial to justify it.
 - **Per session:** stop after 50 experiments and write a session
   summary.
 

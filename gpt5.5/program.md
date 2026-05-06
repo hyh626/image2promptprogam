@@ -41,6 +41,29 @@ In the Gemini-oriented setup:
 
 Model names should be configured in the repo config rather than hardcoded into experiment logic.
 
+## Variance-Control Evaluation Rule
+
+Recent variance research found that both the VLM captioning step and the image
+generation step can introduce enough randomness to mis-rank prompt strategies.
+Future implementations should therefore evaluate each target image/task with a
+nested M-by-N plan:
+
+1. Run **M >= 3 independent VLM caption/decomposition calls** for the target.
+   These may use different random seeds, temperatures, or focused analysis
+   prompts, but they should all observe the same target image and fixed model
+   configuration.
+2. For **each** resulting caption/prompt candidate, run **N >= 2 independent
+   image generations** using distinct generation seeds.
+3. Score every generated image against the target, average scores within each
+   caption, and track the variance across captions and generation seeds.
+4. Compare strategies by robust aggregate performance, not by a single best
+   caption or a single lucky generated image.
+
+Use smaller runs only for local debugging, and clearly label them as smoke
+runs. Any candidate that will be promoted, reported, or used for conclusions
+should be confirmed with at least `M = 3` captions and `N = 2` generations per
+caption; use more samples for finalists when budget allows.
+
 ## What This Repo Optimizes
 
 The repo optimizes prompt text, not model weights.
@@ -116,8 +139,10 @@ models:
 
 generation:
   aspect_ratio: "1:1"
-  num_images_per_prompt: 3
-  min_images_per_prompt: 3
+  vlm_captions_per_target: 3
+  min_vlm_captions_per_target: 3
+  num_images_per_prompt: 2
+  min_images_per_prompt: 2
   seed_policy: fixed_or_random
   negative_prompt_enabled: true
 
@@ -189,14 +214,15 @@ Good initial values:
 beam_width = 2 or 3
 mutations_per_prompt = 3 or 4
 max_iterations = 8
-num_images_per_prompt = 3 during search
-final_reeval_seeds = 3 to 5
+vlm_captions_per_target = 3 or more during real eval
+num_images_per_prompt = 2 or more per caption during real eval
+final_reeval_seeds = 3 to 5 per finalist when budget allows
 ```
 
 Early search should stay cheap by keeping beam width and mutation count modest,
-but every real candidate evaluation still generates and scores at least 3
-images per target/example. Use more than 3 seeds only for finalists or
-late-stage candidates.
+but every real candidate evaluation should still use at least 3 independent
+VLM captions and at least 2 generated images per caption. Use larger M or N
+only for finalists or late-stage candidates.
 
 ## Prompt Representation
 
@@ -342,16 +368,17 @@ Avoid overfitting to a lucky generation.
 Recommended schedule:
 
 ```text
-early search: 1 seed per candidate
-late search: 3 seeds for top candidates
-final report: 3 to 5 seeds for finalists
+debug smoke run: 1 seed per candidate is allowed only to verify plumbing
+real search: M >= 3 VLM captions per target, N >= 2 generations per caption
+late search/final report: increase to 3 to 5 generations per finalist when budget allows
 ```
 
 Report both:
 
 - best-of-k score: best achievable reproduction,
-- average-of-k score: reliable reproduction,
-- score standard deviation: prompt robustness.
+- average-of-k score: reliable reproduction across captions and generations,
+- within-caption generation standard deviation: seed robustness,
+- across-caption standard deviation: VLM caption robustness.
 
 ## Logs and Outputs
 
