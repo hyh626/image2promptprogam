@@ -71,12 +71,28 @@ images.)
 
 ![run detail](docs/screenshots/03-run-detail.png)
 
+### Per-image timeline
+
+A **Timeline** tab pivots the runs-container page from a per-run table into a
+per-image filmstrip: rows are images, columns are runs (left = oldest), and
+each cell shows the generated thumbnail with composite score and a delta vs
+the previous shown run. Promoted columns tint green, rejected ones tint red.
+
+![timeline](docs/screenshots/04-timeline.png)
+
+A **Leader chain** tab filters the same view to runs whose decision is
+`promoted` or `no_leader`, so only the surviving leader trajectory remains
+on screen.
+
+![leader chain](docs/screenshots/05-leader-chain.png)
+
 The screenshots above were generated against the demo fixture from
 `scripts/build_demo_fixture.py`. To reproduce:
 
 ```bash
 python scripts/build_demo_fixture.py --out /tmp/demo-fixture
-python view_eval_results.py --root /tmp/demo-fixture
+python view_eval_results.py --root /tmp/demo-fixture --port 8780 &
+python scripts/render_screenshots.py --base http://127.0.0.1:8780 --out docs/screenshots
 ```
 
 ## Data
