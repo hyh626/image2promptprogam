@@ -45,8 +45,8 @@ Don't confuse the two roles.
 prompt_strategy.py    ← the ONLY file you edit
 harness.py            ← runs the eval loop. DO NOT MODIFY.
 embed_and_score.py    ← four similarity metrics + compositing. DO NOT MODIFY.
-eval_data/images/eval/ ← 30 fixed reference images. DO NOT MODIFY.
-eval_data/images/val/  ← 5 held-out images. DO NOT MODIFY.
+eval_data/images/eval/ ← fixed reference images. DO NOT MODIFY.
+eval_data/images/val/  ← held-out images. DO NOT MODIFY.
 cache/                ← cached features for original images
 runs/                 ← per-experiment artifacts
 weights/              ← downloaded local model weights
@@ -97,7 +97,7 @@ before treating it as evidence.
 uv run harness.py --name <short_descriptive_name>
 ```
 
-For each of the 30 images in `eval_data/images/eval/`, the harness:
+For each image in `eval_data/images/eval/`, the harness:
 
 1. Calls `image_to_prompt(image)` to get a prompt.
 2. Calls Nano Banana 2 with that prompt for each configured generation
@@ -136,11 +136,11 @@ differences don't pollute the signal.
 
 ### Composite
 
-For each of the 30 eval images, compute all four similarities for each
-configured seed, average per image, then aggregate:
+For each image in `eval_data/images/eval/`, compute all four similarities
+for each configured seed, average per image, then aggregate:
 
 ```
-mean_signal[m]  =  mean over 30 eval images of  s_m
+mean_signal[m]  =  mean over the eval images of  s_m
 composite       =  mean across the four metrics
 ```
 
@@ -216,8 +216,9 @@ prompts). Diversity is a goal, not a side effect.
 
 ## Budget guardrails
 
-- **Per experiment:** baseline evals should budget for 30 input images ×
-  M VLM captions (M >= 3) × N image generations per caption (N >= 2),
+- **Per experiment:** baseline evals should budget for every image in
+  `eval_data/images/eval/` × M VLM captions (M >= 3) × N image generations
+  per caption (N >= 2),
   plus local feature extraction for every generated image. If your strategy
   needs more than ~5 VLM calls per image or more than ~3 generations per
   caption, the gain has to be substantial to justify it.
