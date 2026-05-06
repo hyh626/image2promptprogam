@@ -67,6 +67,29 @@ figure figcaption { font-size: 11px; color: var(--muted); margin-top: 2px; }
 .pill.pass { background: #e8f5ec; color: var(--good); }
 .heading { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 4px; }
 .heading code { background: #f1f3f7; padding: 1px 5px; border-radius: 3px; font-size: 12px; }
+.tabs { display: flex; gap: 4px; margin: 0 0 12px 0; border-bottom: 1px solid var(--border); }
+.tab { padding: 6px 12px; font-size: 13px; color: var(--muted); border-radius: 4px 4px 0 0; }
+.tab.active { color: var(--fg); border: 1px solid var(--border); border-bottom-color: var(--panel); background: var(--panel); margin-bottom: -1px; }
+.timeline-wrap { overflow: visible; }
+table.timeline { border-collapse: separate; border-spacing: 0; background: var(--panel); border: 1px solid var(--border); width: auto; }
+table.timeline th, table.timeline td { padding: 6px 8px; border-bottom: 1px solid var(--border); border-right: 1px solid var(--border); vertical-align: top; }
+table.timeline thead th { background: #f5f6f9; font-size: 12px; text-align: left; }
+table.timeline tbody th { text-align: left; font-weight: 600; font-size: 12.5px; min-width: 160px; max-width: 220px; word-break: break-word; }
+.tcol { min-width: 180px; max-width: 220px; }
+.tcol-head a { color: var(--accent); text-decoration: none; word-break: break-all; }
+.tcol-meta { color: var(--muted); font-size: 11px; margin-top: 2px; }
+.tcell { width: 180px; max-width: 200px; text-align: center; }
+.tcell img { max-width: 160px; max-height: 130px; border: 1px solid var(--border); border-radius: 3px; background: #f5f5f5; }
+.tcell.promoted { background: #f4faf6; }
+.tcell.rejected { background: #fdf6f6; }
+.tcell-img { background: #fafbfd; }
+.tcell-target img { max-height: 130px; }
+.tplaceholder { height: 100px; display: flex; align-items: center; justify-content: center; color: var(--muted); font-size: 11px; background: #f9f9f9; border: 1px dashed var(--border); border-radius: 3px; }
+.tscores { font-family: ui-monospace, "SFMono-Regular", Menlo, monospace; font-size: 11px; margin-top: 4px; word-break: break-all; }
+.tscores.tdetail { color: var(--muted); font-size: 10.5px; }
+.tscores .pos { color: var(--good); }
+.tscores .neg { color: var(--bad); }
+.tcell-target-head, .tcell-img-head { background: #f0f2f7; }
 """
 
 
@@ -195,6 +218,138 @@ def render_summary(d):
         f'<tbody>{"".join(body_rows)}</tbody></table>'
     )
     return f'<main class="main">{title}{table}</main>'
+
+
+def render_timeline(d, base, leader_only: bool = False):
+    """Mirror the JS renderTimeline; produce a static HTML grid."""
+    timeline = d.get("timeline") or {}
+    all_runs = timeline.get("runs") or []
+    runs = [r for r in all_runs if r.get("is_leader_promotion")] if leader_only else all_runs
+    image_ids = timeline.get("image_ids") or []
+    cells = timeline.get("cells") or {}
+    manifest = timeline.get("manifest") or {}
+
+    title_path = esc(d.get("path") or d.get("root_name"))
+    if leader_only:
+        tabs = (
+            '<div class="tabs">'
+            '<span class="tab">Summary</span>'
+            '<span class="tab">Timeline</span>'
+            '<span class="tab active">Leader chain</span>'
+            '</div>'
+        )
+    else:
+        tabs = (
+            '<div class="tabs">'
+            '<span class="tab">Summary</span>'
+            '<span class="tab active">Timeline</span>'
+            '<span class="tab">Leader chain</span>'
+            '</div>'
+        )
+
+    subtitle = (
+        f'Leader chain — {len(runs)} promoted run{"" if len(runs)==1 else "s"}, '
+        f'{len(image_ids)} image{"" if len(image_ids)==1 else "s"}'
+        if leader_only else
+        f'All runs — {len(runs)} run{"" if len(runs)==1 else "s"}, '
+        f'{len(image_ids)} image{"" if len(image_ids)==1 else "s"}'
+    )
+
+    if not runs or not image_ids:
+        body = (f'<p class="hint">{esc(subtitle)}</p>'
+                '<p class="hint">Nothing to compare yet.</p>')
+        return f'<main class="main"><h2>{title_path}</h2>{tabs}{body}</main>'
+
+    head_cells = ['<th class="tcell-img-head">image</th>',
+                  '<th class="tcell-target-head">target</th>']
+    for r in runs:
+        cls = ("promoted" if r.get("decision") in ("promoted", "no_leader")
+               else "rejected" if r.get("decision") == "rejected" else "")
+        head_cells.append(
+            f'<th class="tcol {cls}"><div class="tcol-head">'
+            f'<a>{esc(r.get("name") or r.get("run_id"))}</a>'
+            f'<div class="tcol-meta">{esc((r.get("started_at") or "").replace("T", " ").replace("Z", ""))}</div>'
+            f'<div class="tcol-meta">{decision_pill(r.get("decision"))} '
+            f'composite=<b>{fmt(r.get("composite"), 4)}</b></div>'
+            '</div></th>'
+        )
+
+    rows_html = []
+    for image_id in image_ids:
+        meta = manifest.get(image_id) or {}
+        meta_bits = []
+        if meta.get("split"):
+            meta_bits.append(f'<div class="tcol-meta">split: <code>{esc(meta["split"])}</code></div>')
+        if meta.get("category"):
+            meta_bits.append(f'<div class="tcol-meta">{esc(meta["category"])}</div>')
+        meta_block = "".join(meta_bits)
+
+        target_uri = get_image_data_uri(base, meta.get("target_url"))
+        target_cell = (
+            f'<td class="tcell tcell-target"><img src="{target_uri}" alt="target"></td>'
+            if target_uri else '<td class="tcell tcell-target"><div class="tplaceholder">no target</div></td>'
+        )
+
+        run_cells = []
+        prev_composite = None
+        row_cells = cells.get(image_id, {})
+        for r in runs:
+            cell = row_cells.get(r["run_id"])
+            cls = ("promoted" if r.get("decision") in ("promoted", "no_leader")
+                   else "rejected" if r.get("decision") == "rejected" else "")
+            if not cell:
+                run_cells.append(f'<td class="tcell {cls}"><div class="tplaceholder">not in run</div></td>')
+                continue
+
+            gen_uri = get_image_data_uri(base, cell.get("generated_url"))
+            img_html = (
+                f'<img src="{gen_uri}" alt="generated">' if gen_uri
+                else '<div class="tplaceholder">no png</div>'
+            )
+
+            composite = cell.get("composite")
+            delta_html = ""
+            if isinstance(prev_composite, (int, float)) and isinstance(composite, (int, float)):
+                d_val = composite - prev_composite
+                sign = "+" if d_val > 0 else ""
+                dcls = "pos" if d_val > 0 else ("neg" if d_val < 0 else "")
+                delta_html = f' <span class="{dcls}">({sign}{d_val:.3f})</span>'
+
+            scores_inline = " · ".join(
+                f"{esc(k.replace('s_', ''))}={fmt(v, 3)}"
+                for k, v in (cell.get("scores") or {}).items()
+            )
+
+            run_cells.append(
+                f'<td class="tcell {cls}">{img_html}'
+                f'<div class="tscores">composite=<b>{fmt(composite, 4)}</b>{delta_html}</div>'
+                f'<div class="tscores tdetail">{scores_inline}</div>'
+                '</td>'
+            )
+            if isinstance(composite, (int, float)):
+                prev_composite = composite
+
+        rows_html.append(
+            f'<tr><th class="tcell-img"><div>{esc(image_id)}</div>{meta_block}</th>'
+            f'{target_cell}{"".join(run_cells)}</tr>'
+        )
+
+    table = (
+        '<div class="timeline-wrap"><table class="timeline">'
+        f'<thead><tr>{"".join(head_cells)}</tr></thead>'
+        f'<tbody>{"".join(rows_html)}</tbody>'
+        '</table></div>'
+    )
+
+    return (
+        '<main class="main">'
+        f'<h2>{title_path}</h2>'
+        f'{tabs}'
+        f'<p class="meta-row">{esc(subtitle)}. Images on the rows, runs on the '
+        'columns (left = oldest).</p>'
+        f'{table}'
+        '</main>'
+    )
 
 
 def render_run(d, base):
@@ -360,6 +515,20 @@ def main(argv: list[str] | None = None) -> int:
     render_to_png(page(sidebar + detail_main, "1500px", "900px"),
                   out / "03-run-detail.png", "1500px", "900px")
     print(f"wrote {out / '03-run-detail.png'}", file=sys.stderr)
+
+    # 4) Per-image timeline view (all runs across the experiments folder)
+    sidebar = render_sidebar(runs_data)
+    timeline_main = render_timeline(runs_data, args.base, leader_only=False)
+    render_to_png(page(sidebar + timeline_main, "1700px", "900px"),
+                  out / "04-timeline.png", "1700px", "900px")
+    print(f"wrote {out / '04-timeline.png'}", file=sys.stderr)
+
+    # 5) Same view filtered to the leader chain only
+    sidebar = render_sidebar(runs_data)
+    leader_main = render_timeline(runs_data, args.base, leader_only=True)
+    render_to_png(page(sidebar + leader_main, "1500px", "900px"),
+                  out / "05-leader-chain.png", "1500px", "900px")
+    print(f"wrote {out / '05-leader-chain.png'}", file=sys.stderr)
 
     return 0
 
