@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import http.server
 import json
+import os
 import socketserver
 import sys
 import threading
@@ -883,18 +884,50 @@ class ThreadingServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     allow_reuse_address = True
 
 
+def _env_bool(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--root", default=str(Path.cwd()),
-                        help="local path or gs://bucket/prefix (default: cwd)")
-    parser.add_argument("--port", type=int, default=8765, help="port (default: 8765)")
-    parser.add_argument("--host", default="127.0.0.1",
-                        help="bind host (default: 127.0.0.1; use 0.0.0.0 to expose on LAN)")
+    # In Cloud Run / containerized deploys, configuration arrives via env
+    # vars: VIEWER_ROOT, PORT, VIEWER_HOST, VIEWER_GCS_ONLY,
+    # VIEWER_GCS_CACHE_TTL. CLI flags still win when explicitly provided.
+    env_root = os.environ.get("VIEWER_ROOT")
+    env_port = os.environ.get("PORT")
+    env_host = os.environ.get("VIEWER_HOST")
+    env_ttl = os.environ.get("VIEWER_GCS_CACHE_TTL")
+
+    parser.add_argument("--root", default=env_root if env_root else str(Path.cwd()),
+                        help="local path or gs://bucket/prefix (default: cwd; "
+                             "or $VIEWER_ROOT)")
+    parser.add_argument("--port", type=int,
+                        default=int(env_port) if env_port else 8765,
+                        help="port (default: 8765; or $PORT)")
+    parser.add_argument("--host", default=env_host or "127.0.0.1",
+                        help="bind host (default: 127.0.0.1; use 0.0.0.0 to "
+                             "expose on LAN; or $VIEWER_HOST)")
     parser.add_argument("--open", action="store_true",
                         help="open the viewer in the default browser on start")
-    parser.add_argument("--gcs-cache-ttl", type=float, default=30.0,
-                        help="seconds to cache GCS metadata listings (default: 30)")
+    parser.add_argument("--gcs-cache-ttl", type=float,
+                        default=float(env_ttl) if env_ttl else 30.0,
+                        help="seconds to cache GCS metadata listings "
+                             "(default: 30; or $VIEWER_GCS_CACHE_TTL)")
+    parser.add_argument("--gcs-only", action="store_true",
+                        default=_env_bool("VIEWER_GCS_ONLY"),
+                        help="reject local --root values; only allow gs:// URIs. "
+                             "Also enabled by VIEWER_GCS_ONLY=1; the Cloud Run "
+                             "image sets this by default since the container "
+                             "filesystem has no useful runs to browse.")
     args = parser.parse_args(argv)
+
+    if args.gcs_only and not str(args.root).startswith("gs://"):
+        print(
+            f"--gcs-only is set but --root {args.root!r} is not a gs:// URI. "
+            "Set VIEWER_ROOT=gs://bucket/prefix when deploying.",
+            file=sys.stderr,
+        )
+        return 2
 
     global BACKEND
     try:
