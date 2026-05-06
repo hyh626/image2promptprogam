@@ -96,6 +96,40 @@ python view_eval_results.py --root /tmp/demo-fixture --port 8780 &
 python scripts/render_screenshots.py --base http://127.0.0.1:8780 --out docs/screenshots
 ```
 
+### Deploy to Cloud Run (GCS-only)
+
+`Dockerfile` packages the viewer for Cloud Run, and
+`scripts/deploy_cloud_run.sh` builds the image and deploys it. The
+container is locked to GCS roots (`VIEWER_GCS_ONLY=1`); the only useful
+`--root` value is `gs://bucket/prefix`. Auth uses Application Default
+Credentials, which inside Cloud Run resolve to the runtime service
+account passed via `--service-account`. Grant that SA
+`roles/storage.objectViewer` on the bucket beforehand.
+
+```bash
+./scripts/deploy_cloud_run.sh \
+  --project my-project \
+  --region us-central1 \
+  --service image2prompt-viewer \
+  --bucket gs://image2promptdata/experiments \
+  --service-account viewer-runtime@my-project.iam.gserviceaccount.com
+```
+
+By default the Cloud Run service is IAM-protected (`--no-allow-unauthenticated`).
+Pass `--allow-unauthenticated` to publish a public URL. The script
+prints the service URL on success, plus a sample
+`Authorization: Bearer …` curl when the service is private.
+
+Configuration env vars the container reads:
+
+| Env var               | Purpose                                                    |
+|-----------------------|------------------------------------------------------------|
+| `VIEWER_ROOT`         | `gs://bucket/prefix` to browse (required)                  |
+| `PORT`                | Listen port; injected by Cloud Run, defaults to 8080       |
+| `VIEWER_HOST`         | Bind address; the image defaults to `0.0.0.0`              |
+| `VIEWER_GCS_ONLY`     | When `1`, refuse local roots; the image sets this default  |
+| `VIEWER_GCS_CACHE_TTL`| Seconds to cache GCS metadata listings (default `30`)      |
+
 ## Data
 
 The train and eval data live in:

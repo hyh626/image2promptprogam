@@ -1,7 +1,9 @@
 """Tests for view_eval_results.py."""
 from __future__ import annotations
 
+import io
 import json
+import os
 import socket
 import sys
 import tempfile
@@ -9,6 +11,7 @@ import threading
 import time
 import unittest
 import urllib.request
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 THIS_DIR = Path(__file__).resolve().parent
@@ -416,6 +419,73 @@ class HttpServerTests(unittest.TestCase):
         self.assertEqual(status, 404)
         status, _, _ = self._get("/api/file?path=missing.png")
         self.assertEqual(status, 404)
+
+
+class CloudRunEntrypointTests(unittest.TestCase):
+    """`--gcs-only` and the env-var-driven defaults that Cloud Run depends on."""
+
+    def setUp(self) -> None:
+        # Snapshot env so individual tests can poke specific vars.
+        self._env_keys = (
+            "VIEWER_ROOT", "VIEWER_HOST", "VIEWER_GCS_ONLY",
+            "VIEWER_GCS_CACHE_TTL", "PORT",
+        )
+        self._saved = {k: os.environ.pop(k, None) for k in self._env_keys}
+
+    def tearDown(self) -> None:
+        for k, val in self._saved.items():
+            os.environ.pop(k, None)
+            if val is not None:
+                os.environ[k] = val
+
+    def test_gcs_only_flag_rejects_local_root(self) -> None:
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
+            rc = v.main(["--root", "/tmp", "--gcs-only"])
+        self.assertEqual(rc, 2)
+        self.assertIn("gs://", err.getvalue())
+
+    def test_gcs_only_env_rejects_local_root(self) -> None:
+        os.environ["VIEWER_GCS_ONLY"] = "1"
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            rc = v.main(["--root", "/tmp"])
+        self.assertEqual(rc, 2)
+
+    def _stub_make_backend(self, captured: dict):
+        """Replace make_backend with a recorder that raises before binding."""
+        original = v.make_backend
+
+        def fake(root, ttl):
+            captured["root"] = root
+            captured["ttl"] = ttl
+            raise ImportError("stubbed: short-circuit before server bind")
+
+        self.addCleanup(lambda: setattr(v, "make_backend", original))
+        v.make_backend = fake
+
+    def test_gcs_only_flag_accepts_gs_root(self) -> None:
+        captured: dict = {}
+        self._stub_make_backend(captured)
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            rc = v.main(["--root", "gs://test-bucket/x", "--gcs-only"])
+        # rc=1 because the stubbed make_backend raises ImportError;
+        # rc=2 would mean the gcs-only validation rejected the gs:// root.
+        self.assertEqual(rc, 1)
+        self.assertEqual(captured["root"], "gs://test-bucket/x")
+
+    def test_env_var_defaults_apply(self) -> None:
+        os.environ["VIEWER_ROOT"] = "gs://envb/envp"
+        os.environ["PORT"] = "5500"
+        os.environ["VIEWER_HOST"] = "0.0.0.0"
+        os.environ["VIEWER_GCS_CACHE_TTL"] = "12.5"
+        os.environ["VIEWER_GCS_ONLY"] = "1"
+        captured: dict = {}
+        self._stub_make_backend(captured)
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            rc = v.main([])
+        # Env's VIEWER_ROOT must have flowed into make_backend (not cwd).
+        self.assertEqual(captured["root"], "gs://envb/envp")
+        self.assertAlmostEqual(captured["ttl"], 12.5)
+        self.assertEqual(rc, 1)  # ImportError from stub, not a 2 from validation
 
 
 if __name__ == "__main__":

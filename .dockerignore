@@ -1,0 +1,25 @@
+# Keep the build context lean.
+.git
+.gitignore
+.dockerignore
+__pycache__
+**/__pycache__
+*.pyc
+.pytest_cache
+.venv
+venv
+docs
+scripts
+tests
+exp_implementation
+data
+*.md
+opus4.7
+gpt5.5
+gemini3.1pro
+prompts
+prepare_agent_task.sh
+sync_runs_to_gcs.py
+check_eval_storage.py
+pyproject.toml
+Dockerfile
