@@ -466,6 +466,7 @@ copy_source_dir "$SOURCE_DIR" "$TARGET_DIR"
 info "Copying eval storage schema"
 copy_file_if_missing "$SCRIPT_DIR/EVAL_STORAGE_SCHEMA.md" "$TARGET_DIR/EVAL_STORAGE_SCHEMA.md"
 copy_file_if_missing "$SCRIPT_DIR/check_eval_storage.py" "$TARGET_DIR/check_eval_storage.py"
+copy_file_if_missing "$SCRIPT_DIR/storage_backend.py" "$TARGET_DIR/storage_backend.py"
 
 if [[ -f "$TARGET_DIR/program.md" ]]; then
   write_agent_context_file "$TARGET_DIR/AGENTS.md"
