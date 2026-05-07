@@ -23,6 +23,21 @@
 #   --min-instances N                    default: 0
 #   --gcs-cache-ttl SECONDS              default: 30
 #   --allow-unauthenticated              make the URL public (default: off)
+#   --iap                                turn on Identity-Aware Proxy on
+#                                        the Cloud Run service so a
+#                                        browser session can sign in with
+#                                        Google IAM and reach the URL
+#                                        without a bearer token. Mutually
+#                                        exclusive with
+#                                        --allow-unauthenticated.
+#   --iap-member EMAIL                   grant this principal
+#                                        roles/iap.httpsResourceAccessor
+#                                        on the Cloud Run service.
+#                                        Repeatable. Accepts the gcloud
+#                                        IAM member syntax, e.g.
+#                                        user:alice@example.com,
+#                                        group:eng@example.com,
+#                                        domain:example.com.
 #   --skip-build                         reuse the existing image; skip
 #                                        gcloud builds submit
 #   --dry-run                            print the gcloud commands without
@@ -36,11 +51,17 @@
 #     --service-account viewer-runtime@my-proj.iam.gserviceaccount.com
 #
 #   ./scripts/deploy_cloud_run.sh ... --allow-unauthenticated   # public URL
+#
+#   # IAP-protected URL openable in a browser by named users:
+#   ./scripts/deploy_cloud_run.sh ... \
+#     --iap \
+#     --iap-member user:alice@example.com \
+#     --iap-member group:eng@example.com
 
 set -euo pipefail
 
 usage() {
-  sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,59p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 PROJECT="${GOOGLE_CLOUD_PROJECT:-}"
@@ -56,6 +77,8 @@ MAX_INSTANCES="4"
 MIN_INSTANCES="0"
 GCS_CACHE_TTL="30"
 ALLOW_UNAUTHENTICATED=0
+ENABLE_IAP=0
+IAP_MEMBERS=()
 SKIP_BUILD=0
 DRY_RUN=0
 
@@ -74,6 +97,8 @@ while [[ $# -gt 0 ]]; do
     --min-instances) MIN_INSTANCES="$2"; shift 2 ;;
     --gcs-cache-ttl) GCS_CACHE_TTL="$2"; shift 2 ;;
     --allow-unauthenticated) ALLOW_UNAUTHENTICATED=1; shift ;;
+    --iap) ENABLE_IAP=1; shift ;;
+    --iap-member) IAP_MEMBERS+=("$2"); shift 2 ;;
     --skip-build) SKIP_BUILD=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -91,6 +116,14 @@ if [[ "$BUCKET" != gs://* ]]; then
 fi
 if [[ -z "$SERVICE_ACCOUNT" ]]; then
   echo "error: --service-account EMAIL is required" >&2
+  exit 2
+fi
+if (( ENABLE_IAP )) && (( ALLOW_UNAUTHENTICATED )); then
+  echo "error: --iap and --allow-unauthenticated are mutually exclusive" >&2
+  exit 2
+fi
+if (( ${#IAP_MEMBERS[@]} > 0 )) && ! (( ENABLE_IAP )); then
+  echo "error: --iap-member requires --iap" >&2
   exit 2
 fi
 if [[ -z "$PROJECT" ]]; then
@@ -147,9 +180,28 @@ if (( ALLOW_UNAUTHENTICATED )); then
 else
   DEPLOY_ARGS+=(--no-allow-unauthenticated)
 fi
+if (( ENABLE_IAP )); then
+  # Cloud Run Gen2 supports a built-in IAP integration: --iap on the
+  # service makes IAP the only path to the URL, and signed-in browser
+  # users with roles/iap.httpsResourceAccessor can reach the page
+  # directly. (Older gcloud versions don't know this flag; the failure
+  # message is informative.)
+  DEPLOY_ARGS+=(--iap)
+fi
 
 echo "==> deploying $SERVICE to Cloud Run in $REGION as $SERVICE_ACCOUNT"
 run gcloud "${DEPLOY_ARGS[@]}"
+
+if (( ENABLE_IAP )) && (( ${#IAP_MEMBERS[@]} > 0 )); then
+  echo "==> granting roles/iap.httpsResourceAccessor on $SERVICE to ${#IAP_MEMBERS[@]} member(s)"
+  for member in "${IAP_MEMBERS[@]}"; do
+    run gcloud run services add-iam-policy-binding "$SERVICE" \
+      --project "$PROJECT" --region "$REGION" \
+      --member "$member" \
+      --role roles/iap.httpsResourceAccessor \
+      --quiet
+  done
+fi
 
 if ! (( DRY_RUN )); then
   URL="$(gcloud run services describe "$SERVICE" \
@@ -157,7 +209,17 @@ if ! (( DRY_RUN )); then
     --format='value(status.url)' 2>/dev/null || true)"
   if [[ -n "$URL" ]]; then
     echo "==> service URL: $URL"
-    if ! (( ALLOW_UNAUTHENTICATED )); then
+    if (( ENABLE_IAP )); then
+      echo "    (IAP-protected; open in a browser as a signed-in member with"
+      echo "     roles/iap.httpsResourceAccessor on this service)"
+      if ! (( ${#IAP_MEMBERS[@]} > 0 )); then
+        echo "    (no --iap-member given; grant access with:"
+        echo "       gcloud run services add-iam-policy-binding $SERVICE \\"
+        echo "         --project $PROJECT --region $REGION \\"
+        echo "         --member user:you@example.com \\"
+        echo "         --role roles/iap.httpsResourceAccessor )"
+      fi
+    elif ! (( ALLOW_UNAUTHENTICATED )); then
       echo "    (IAM-protected; reach it with:"
       echo "       curl -H \"Authorization: Bearer \$(gcloud auth print-identity-token)\" $URL )"
     fi

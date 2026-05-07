@@ -29,12 +29,23 @@ RUN pip install "google-cloud-storage>=2.0"
 COPY storage_backend.py view_eval_results.py /app/
 
 # Defaults that make sense in Cloud Run; can be overridden at deploy time.
+# google-auth resolves ~/.config/... so HOME must be a writable dir owned
+# by the runtime user, and XDG_CACHE_HOME pre-empts any stray cache writes
+# under a non-writable HOME.
 ENV VIEWER_HOST=0.0.0.0 \
     VIEWER_GCS_ONLY=1 \
-    PORT=8080
+    PORT=8080 \
+    HOME=/home/viewer \
+    XDG_CACHE_HOME=/tmp
 
-# Run as a non-root user for defence-in-depth.
-RUN useradd --system --uid 10001 viewer
+# Run as a non-root user for defence-in-depth. --create-home gives the
+# user a real, writable HOME so google-auth/google-cloud-storage can
+# resolve ADC config paths without permission errors at startup.
+RUN groupadd --system --gid 10001 viewer \
+ && useradd  --system --uid 10001 --gid 10001 \
+             --home-dir /home/viewer --create-home --shell /sbin/nologin viewer \
+ && chown -R viewer:viewer /app /home/viewer
+
 USER viewer
 
 EXPOSE 8080

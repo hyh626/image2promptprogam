@@ -1,0 +1,35 @@
+# Files NOT uploaded to Cloud Build by `gcloud builds submit`.
+#
+# We only need Dockerfile + the two Python files; everything else is
+# repository/spec content unrelated to the runtime image. Keeping the
+# build context small also speeds up uploads from a slow link.
+.git
+.gitignore
+.dockerignore
+.gcloudignore
+
+# Python build/runtime caches.
+__pycache__/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+
+# Repo content that the viewer never reads.
+docs/
+scripts/
+tests/
+exp_implementation/
+data/
+opus4.7/
+gpt5.5/
+gemini3.1pro/
+prompts
+prepare_agent_task.sh
+sync_runs_to_gcs.py
+check_eval_storage.py
+pyproject.toml
+
+# Markdown docs are repo-only.
+*.md

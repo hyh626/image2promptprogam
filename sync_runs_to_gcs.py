@@ -17,9 +17,21 @@ Usage:
     python sync_runs_to_gcs.py --src . --dst gs://bucket/path --runs <run_id_a> <run_id_b>
     python sync_runs_to_gcs.py --src . --dst gs://... --dry-run
 
+    # Back-fill _index.json on an older bucket that already has the
+    # run artifacts but no precomputed summary, without re-uploading
+    # any of the run files:
+    python sync_runs_to_gcs.py --dst gs://bucket/path \
+        --index-only --index-from remote
+
 By default only files that are missing or have a different size remotely
 are uploaded. Use --force to re-upload everything. Use --delete to remove
 remote files that no longer exist locally (scoped to synced subtrees).
+
+After the file sync, a precomputed summary `experiments/runs/_index.json`
+is also uploaded so view_eval_results.py can render the Summary and
+Timeline tabs from a single fetch instead of walking every run on GCS.
+Pass --no-index to suppress it. The viewer treats it as best-effort:
+when missing, it falls back to the slower per-run walk.
 
 Concurrency: --workers controls parallel uploads (default 8). Ctrl-C is
 safe; in-flight uploads finish, no partial files are left.
@@ -28,8 +40,10 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import datetime as _dt
 import fnmatch
 import hashlib
+import json
 import os
 import sys
 import time
@@ -319,6 +333,245 @@ def run_plan(plan: Plan, client, bucket, dry_run: bool, workers: int, quiet: boo
     return stats
 
 
+# --------------------------- runs index ---------------------------
+#
+# We additionally publish a single `_index.json` file at
+#   <dst>/experiments/runs/_index.json
+#
+# It is a precomputed summary of every run under that prefix so the
+# viewer can render the Summary and Timeline tabs from one fetch instead
+# of walking N runs × M images of metadata over GCS. The viewer treats
+# the file as best-effort: if it is missing, it falls back to the slow
+# per-run walk, so this never breaks an older bucket layout.
+
+INDEX_SCHEMA_VERSION = "1.0.0"
+INDEX_FILENAME = "_index.json"
+
+
+def _safe_load_local_json(path: Path) -> dict:
+    if not path.is_file():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def build_runs_index(src: Path, runs_filter: list[str] | None = None) -> dict | None:
+    """Return a precomputed summary of `<src>/experiments/runs/*`.
+
+    `runs_filter`, if provided, restricts the entries we (re)scan. Other
+    runs that are already on the bucket are *not* preserved here; the
+    caller may merge with an existing remote index when only a subset of
+    runs were re-synced.
+    """
+    runs_dir = src / "experiments" / "runs"
+    if not runs_dir.is_dir():
+        return None
+    runs_filter_set = set(runs_filter) if runs_filter else None
+
+    entries: list[dict] = []
+    for run_dir in sorted(runs_dir.iterdir()):
+        if not run_dir.is_dir():
+            continue
+        if runs_filter_set is not None and run_dir.name not in runs_filter_set:
+            continue
+        run = _safe_load_local_json(run_dir / "run.json")
+        if not run:
+            continue
+        agg = _safe_load_local_json(run_dir / "aggregate.json")
+        gate = _safe_load_local_json(run_dir / "gate.json")
+
+        cells: dict[str, dict] = {}
+        for image_id in run.get("image_ids") or []:
+            per = run_dir / "per_image" / image_id
+            scores_doc = _safe_load_local_json(per / "scores.json")
+            cells[image_id] = {
+                "scores": scores_doc.get("scores") or {},
+                "judge": scores_doc.get("judge"),
+                "has_generated": (per / "generated.png").is_file(),
+                "prompt_chars": (per / "prompt.txt").stat().st_size
+                if (per / "prompt.txt").is_file() else 0,
+            }
+
+        entries.append({
+            "run_id": run.get("run_id") or run_dir.name,
+            "path": f"experiments/runs/{run_dir.name}",
+            "name": run.get("name"),
+            "driver": run.get("driver"),
+            "harness_variant": run.get("harness_variant"),
+            "split": run.get("split"),
+            "started_at": run.get("started_at"),
+            "finished_at": run.get("finished_at"),
+            "status": run.get("status"),
+            "hypothesis": run.get("hypothesis"),
+            "image_ids": run.get("image_ids") or [],
+            "n_images": agg.get("n_images") or len(run.get("image_ids") or []),
+            "means": agg.get("means") or {},
+            "composite": agg.get("composite"),
+            "composite_unweighted": agg.get("composite_unweighted"),
+            "decision": gate.get("decision"),
+            "single_run_gate": gate.get("single_run_gate"),
+            "three_seed_gate": gate.get("three_seed_gate"),
+            "cells": cells,
+        })
+
+    return {
+        "schema_version": INDEX_SCHEMA_VERSION,
+        "generated_at": _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "runs": entries,
+    }
+
+
+def _safe_load_remote_json(client, bucket, obj: str) -> dict:
+    blob = bucket.blob(obj)
+    try:
+        if not blob.exists(client):
+            return {}
+        return json.loads(blob.download_as_text())
+    except Exception:
+        return {}
+
+
+def build_runs_index_from_remote(
+    client,
+    bucket,
+    prefix: str,
+    runs_filter: list[str] | None = None,
+) -> dict:
+    """Build the index by reading directly from the destination bucket.
+
+    Useful for older buckets that already have run artifacts uploaded
+    but no `_index.json`: you can publish one without having to re-mirror
+    every byte from local disk. Performs O(runs) list calls plus
+    O(runs × images) JSON downloads.
+    """
+    runs_prefix = remote_object(prefix, "experiments/runs/")
+    if not runs_prefix.endswith("/"):
+        runs_prefix += "/"
+
+    iterator = client.list_blobs(bucket, prefix=runs_prefix, delimiter="/")
+    list(iterator)  # exhaust before reading .prefixes
+    run_dir_prefixes = sorted(getattr(iterator, "prefixes", []) or [])
+
+    runs_filter_set = set(runs_filter) if runs_filter else None
+    entries: list[dict] = []
+    for run_prefix_full in run_dir_prefixes:
+        run_id = run_prefix_full[len(runs_prefix):].rstrip("/")
+        if not run_id or run_id.startswith("."):
+            continue
+        if runs_filter_set is not None and run_id not in runs_filter_set:
+            continue
+
+        # Single list call enumerates every blob in the run; we use it
+        # to do membership checks without per-file HEADs.
+        run_blobs = {b.name for b in client.list_blobs(bucket, prefix=run_prefix_full)}
+
+        run = _safe_load_remote_json(client, bucket, run_prefix_full + "run.json")
+        if not run:
+            continue
+        agg = _safe_load_remote_json(client, bucket, run_prefix_full + "aggregate.json")
+        gate = _safe_load_remote_json(client, bucket, run_prefix_full + "gate.json")
+
+        cells: dict[str, dict] = {}
+        for image_id in run.get("image_ids") or []:
+            per_prefix = run_prefix_full + f"per_image/{image_id}/"
+            scores_obj = per_prefix + "scores.json"
+            scores_doc = (
+                _safe_load_remote_json(client, bucket, scores_obj)
+                if scores_obj in run_blobs else {}
+            )
+            cells[image_id] = {
+                "scores": scores_doc.get("scores") or {},
+                "judge": scores_doc.get("judge"),
+                "has_generated": (per_prefix + "generated.png") in run_blobs,
+                "prompt_chars": 0,
+            }
+
+        entries.append({
+            "run_id": run.get("run_id") or run_id,
+            "path": f"experiments/runs/{run_id}",
+            "name": run.get("name"),
+            "driver": run.get("driver"),
+            "harness_variant": run.get("harness_variant"),
+            "split": run.get("split"),
+            "started_at": run.get("started_at"),
+            "finished_at": run.get("finished_at"),
+            "status": run.get("status"),
+            "hypothesis": run.get("hypothesis"),
+            "image_ids": run.get("image_ids") or [],
+            "n_images": agg.get("n_images") or len(run.get("image_ids") or []),
+            "means": agg.get("means") or {},
+            "composite": agg.get("composite"),
+            "composite_unweighted": agg.get("composite_unweighted"),
+            "decision": gate.get("decision"),
+            "single_run_gate": gate.get("single_run_gate"),
+            "three_seed_gate": gate.get("three_seed_gate"),
+            "cells": cells,
+        })
+
+    return {
+        "schema_version": INDEX_SCHEMA_VERSION,
+        "generated_at": _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "runs": entries,
+    }
+
+
+def merge_remote_index(remote: dict | None, fresh: dict, runs_filter: list[str]) -> dict:
+    """When --runs scoped a sync, keep entries on the remote index for
+    runs we did not touch this pass.
+    """
+    if not runs_filter or not remote:
+        return fresh
+    fresh_ids = {r.get("run_id") for r in fresh.get("runs") or []}
+    merged: list[dict] = list(fresh.get("runs") or [])
+    for entry in remote.get("runs") or []:
+        rid = entry.get("run_id")
+        if rid and rid not in fresh_ids and rid not in runs_filter:
+            merged.append(entry)
+    merged.sort(key=lambda r: r.get("started_at") or "")
+    return {**fresh, "runs": merged}
+
+
+def fetch_remote_index(client, bucket, prefix: str) -> dict | None:
+    obj = remote_object(prefix, f"experiments/runs/{INDEX_FILENAME}")
+    blob = bucket.blob(obj)
+    try:
+        if not blob.exists(client):
+            return None
+        text = blob.download_as_text()
+    except Exception:
+        return None
+    try:
+        return json.loads(text)
+    except Exception:
+        return None
+
+
+def upload_runs_index(
+    client,
+    bucket,
+    prefix: str,
+    payload: dict,
+    dry_run: bool,
+    quiet: bool,
+) -> None:
+    obj = remote_object(prefix, f"experiments/runs/{INDEX_FILENAME}")
+    body = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    if dry_run:
+        if not quiet:
+            print(f"WOULD UPLOAD {obj} ({len(body)} B, runs={len(payload.get('runs') or [])})")
+        return
+    blob = bucket.blob(obj)
+    try:
+        blob.upload_from_string(body, content_type="application/json", client=client)
+    except Exception as exc:  # noqa: BLE001
+        print(f"FAIL {obj}: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return
+    if not quiet:
+        print(f"uploaded {obj} ({len(body)} B, runs={len(payload.get('runs') or [])})")
+
+
 # --------------------------- entry point ---------------------------
 
 
@@ -340,10 +593,34 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dry-run", action="store_true",
                         help="print what would happen without uploading or deleting")
     parser.add_argument("--quiet", action="store_true", help="suppress per-file output")
+    parser.add_argument("--no-index", action="store_true",
+                        help="skip writing experiments/runs/_index.json (the "
+                             "viewer reads this for fast Summary/Timeline loads)")
+    parser.add_argument("--index-only", action="store_true",
+                        help="skip the file sync entirely; only build and "
+                             "upload experiments/runs/_index.json. Use this "
+                             "to back-fill an index on an older bucket "
+                             "without re-uploading the run artifacts.")
+    parser.add_argument("--index-from", choices=("local", "remote"), default="local",
+                        help="source the index data is built from. 'local' "
+                             "(default) reads run.json/aggregate.json/"
+                             "gate.json/per-image scores from --src. "
+                             "'remote' walks --dst on the bucket directly, "
+                             "which lets you bootstrap the index even when "
+                             "the local mirror is gone.")
     args = parser.parse_args(argv)
 
+    if args.index_only and args.no_index:
+        print("--index-only and --no-index are mutually exclusive", file=sys.stderr)
+        return 2
+    if args.index_from == "remote" and not args.index_only:
+        print("--index-from remote only applies with --index-only", file=sys.stderr)
+        return 2
+
+    # `--src` is only required for paths that read from the local mirror.
+    needs_local_src = not (args.index_only and args.index_from == "remote")
     src = args.src.resolve()
-    if not src.is_dir():
+    if needs_local_src and not src.is_dir():
         print(f"--src {src} is not a directory", file=sys.stderr)
         return 1
 
@@ -361,6 +638,38 @@ def main(argv: list[str] | None = None) -> int:
 
     client = storage.Client()
     bucket = client.bucket(bucket_name)
+
+    if args.index_only:
+        if not args.quiet:
+            scope = (f"runs={list(args.runs)}" if args.runs else "all runs")
+            origin = "remote bucket" if args.index_from == "remote" else f"local {src}"
+            print(f"Index-only mode: building from {origin}; scope={scope}; "
+                  f"dst={args.dst}", file=sys.stderr)
+
+        if args.index_from == "remote":
+            fresh = build_runs_index_from_remote(
+                client, bucket, prefix,
+                runs_filter=list(args.runs) or None,
+            )
+        else:
+            built = build_runs_index(src, runs_filter=list(args.runs) or None)
+            if built is None:
+                print(f"no experiments/runs/ found under {src}; nothing to index. "
+                      "Pass --index-from remote to read from the bucket "
+                      "instead.", file=sys.stderr)
+                return 1
+            fresh = built
+
+        if not fresh.get("runs"):
+            print("warning: no runs discovered; uploading an empty index "
+                  "(consider --index-from remote, or check --runs filters).",
+                  file=sys.stderr)
+
+        remote = fetch_remote_index(client, bucket, prefix) if args.runs else None
+        payload = merge_remote_index(remote, fresh, list(args.runs))
+        upload_runs_index(client, bucket, prefix, payload,
+                          dry_run=args.dry_run, quiet=args.quiet)
+        return 0
 
     plan = build_plan(
         src=src,
@@ -381,6 +690,18 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     stats = run_plan(plan, client, bucket, args.dry_run, args.workers, args.quiet)
+
+    if not args.no_index:
+        fresh = build_runs_index(src, runs_filter=list(args.runs) or None)
+        if fresh is None:
+            if not args.quiet:
+                print("(no experiments/runs/ on disk; skipping index)", file=sys.stderr)
+        else:
+            remote = fetch_remote_index(client, bucket, prefix) if args.runs else None
+            payload = merge_remote_index(remote, fresh, list(args.runs))
+            upload_runs_index(client, bucket, prefix, payload,
+                              dry_run=args.dry_run, quiet=args.quiet)
+
     return 0 if stats.failures == 0 else 1
 
 
