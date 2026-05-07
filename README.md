@@ -154,6 +154,21 @@ objects on each page load. The viewer falls back to the per-run walk
 if the file is missing, so older buckets keep working — re-run sync to
 get the speedup. Pass `--no-index` to suppress writing it.
 
+To back-fill an index on an older bucket without re-uploading the run
+artifacts, run sync in index-only mode. Reading from the bucket
+directly works even when the local mirror is gone:
+
+```bash
+# bootstrap _index.json from the bucket itself; no file uploads:
+python sync_runs_to_gcs.py \
+  --dst gs://image2promptdata/experiments \
+  --index-only --index-from remote
+```
+
+`--index-only --index-from local` is also available when you still
+have the source repo around and just want to refresh the index quickly
+without going through the full plan/skip/upload loop.
+
 ## Data
 
 The train and eval data live in:

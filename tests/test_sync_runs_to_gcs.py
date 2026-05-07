@@ -354,5 +354,89 @@ class RunsIndexTests(unittest.TestCase):
         self.assertEqual(ids, sorted([RUN_ID, "OTHER"]))
 
 
+class IndexOnlyTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        build_minimal_repo(self.root)
+        _FAKE_CLIENT._buckets.clear()
+        self.bucket = _FAKE_CLIENT.bucket("test-bucket")
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+        _FAKE_CLIENT._buckets.clear()
+
+    def test_index_only_local_skips_file_sync(self) -> None:
+        # Pre-populate the bucket with stale data; --index-only must not
+        # touch any of those files, only write the index.
+        self.bucket.blobs["mirror/experiments/runs/old/run.json"] = b'{"old":true}'
+        before = dict(self.bucket.blobs)
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            rc = s.main([
+                "--src", str(self.root),
+                "--dst", "gs://test-bucket/mirror",
+                "--index-only", "--quiet",
+            ])
+        self.assertEqual(rc, 0)
+        # Stale blob untouched.
+        self.assertEqual(self.bucket.blobs["mirror/experiments/runs/old/run.json"],
+                         before["mirror/experiments/runs/old/run.json"])
+        # No new uploads beyond the index itself.
+        new_keys = set(self.bucket.blobs) - set(before)
+        self.assertEqual(new_keys, {"mirror/experiments/runs/_index.json"})
+        idx = json.loads(self.bucket.blobs["mirror/experiments/runs/_index.json"])
+        self.assertEqual([r["run_id"] for r in idx["runs"]], [RUN_ID])
+
+    def test_index_only_remote_reads_bucket_and_writes_index(self) -> None:
+        # Seed the bucket with run artifacts as if from an older sync.
+        # We mirror the local fixture's run dir under the destination
+        # prefix, then run --index-only --index-from remote and assert
+        # the index ends up populated even if local --src has no runs.
+        from tests._fixtures import seed_bucket_from_local
+        seed_bucket_from_local(self.bucket, self.root, prefix="mirror")
+        # Strip the run files from local disk to prove we are reading
+        # the bucket, not the local mirror.
+        import shutil
+        shutil.rmtree(self.root / "experiments")
+
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            rc = s.main([
+                "--src", str(self.root),
+                "--dst", "gs://test-bucket/mirror",
+                "--index-only", "--index-from", "remote", "--quiet",
+            ])
+        self.assertEqual(rc, 0)
+        body = self.bucket.blobs["mirror/experiments/runs/_index.json"]
+        idx = json.loads(body.decode("utf-8"))
+        self.assertEqual(len(idx["runs"]), 1)
+        entry = idx["runs"][0]
+        self.assertEqual(entry["run_id"], RUN_ID)
+        self.assertEqual(entry["composite"], 0.5)
+        self.assertEqual(entry["decision"], "no_leader")
+        # Cells were populated from per-image scores.json on the bucket.
+        self.assertIn("hero_photo_01", entry["cells"])
+        self.assertTrue(entry["cells"]["hero_photo_01"]["has_generated"])
+
+    def test_index_only_with_no_index_is_rejected(self) -> None:
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
+            rc = s.main([
+                "--src", str(self.root),
+                "--dst", "gs://test-bucket/mirror",
+                "--index-only", "--no-index",
+            ])
+        self.assertEqual(rc, 2)
+        self.assertIn("mutually exclusive", err.getvalue())
+
+    def test_index_from_remote_without_index_only_is_rejected(self) -> None:
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
+            rc = s.main([
+                "--src", str(self.root),
+                "--dst", "gs://test-bucket/mirror",
+                "--index-from", "remote",
+            ])
+        self.assertEqual(rc, 2)
+        self.assertIn("--index-only", err.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()
