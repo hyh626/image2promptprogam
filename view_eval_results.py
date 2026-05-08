@@ -533,19 +533,24 @@ INDEX_HTML = r"""<!doctype html>
   .tabs .tab { background: none; border: 1px solid transparent; border-bottom: none; padding: 6px 12px; font-size: 13px; cursor: pointer; color: var(--muted); border-radius: 4px 4px 0 0; }
   .tabs .tab.active { color: var(--fg); border-color: var(--border); background: var(--panel); margin-bottom: -1px; }
   .tabs .tab:hover { color: var(--fg); }
-  /* The earlier `table { width: 100% }` rule would squeeze cells until
-     no horizontal scrollbar ever appeared. Force the timeline table to
-     its content width instead, and let the wrap scroll horizontally. */
-  .timeline-wrap { overflow-x: auto; overflow-y: visible; max-width: 100%; }
-  table.timeline { width: max-content; min-width: 100%; border-collapse: separate; border-spacing: 0; background: var(--panel); border: 1px solid var(--border); }
+  /* The earlier `table { width: 100% }` rule (plus tbody-th's max-width)
+     would squeeze cells until no horizontal scrollbar ever appeared.
+     Force fixed per-column widths so the table is predictably wider
+     than the viewport on busy datasets, and let the wrap scroll on x. */
+  .timeline-wrap { overflow-x: auto; overflow-y: hidden; max-width: 100%; }
+  table.timeline { width: auto; border-collapse: separate; border-spacing: 0; background: var(--panel); border: 1px solid var(--border); }
   table.timeline th, table.timeline td { padding: 6px 8px; border-bottom: 1px solid var(--border); border-right: 1px solid var(--border); vertical-align: top; }
   table.timeline thead th { background: #f5f6f9; font-size: 12px; text-align: left; }
-  table.timeline tbody th { text-align: left; font-weight: 600; font-size: 12.5px; min-width: 160px; max-width: 220px; word-break: break-word; }
-  .tcol { min-width: 180px; max-width: 220px; }
+  table.timeline tbody th { text-align: left; font-weight: 600; font-size: 12.5px; word-break: break-word; }
+  /* Per-column widths win against `tbody th` via the `table.timeline`
+     class qualifier (higher specificity). */
+  table.timeline .tcell-img-head, table.timeline .tcell-img { width: 180px; min-width: 180px; max-width: 180px; }
+  table.timeline .tcell-target-head, table.timeline .tcell-target { width: 180px; min-width: 180px; max-width: 180px; }
+  table.timeline .tcol, table.timeline .tcell { width: 200px; min-width: 200px; max-width: 200px; }
   .tcol-head a { color: var(--accent); text-decoration: none; word-break: break-all; }
   .tcol-head a:hover { text-decoration: underline; }
   .tcol-meta { color: var(--muted); font-size: 11px; margin-top: 2px; }
-  .tcell { width: 180px; max-width: 200px; text-align: center; }
+  .tcell { text-align: center; }
   .tcell img { max-width: 160px; max-height: 130px; border: 1px solid var(--border); border-radius: 3px; background: #f5f5f5; }
   .tcell.promoted { background: #f4faf6; }
   .tcell.rejected { background: #fdf6f6; }
@@ -557,6 +562,22 @@ INDEX_HTML = r"""<!doctype html>
   .tscores .pos { color: var(--good); }
   .tscores .neg { color: var(--bad); }
   .tcell-target-head, .tcell-img-head { background: #f0f2f7; }
+  /* Pin image_id + target columns to the left so the row identity and
+     ground-truth target stay on screen while the run columns scroll. */
+  table.timeline .tcell-img-head, table.timeline .tcell-img {
+    position: sticky;
+    left: 0;
+    z-index: 2;
+  }
+  table.timeline .tcell-target-head, table.timeline .tcell-target {
+    position: sticky;
+    left: 180px;
+    z-index: 2;
+    /* Right-edge shadow shows when the run columns are scrolled
+       behind the pinned cluster; harmless when nothing is scrolled. */
+    box-shadow: 6px 0 8px -6px rgba(0,0,0,0.18);
+  }
+  table.timeline thead th.tcell-img-head, table.timeline thead th.tcell-target-head { z-index: 3; }
   .toolrow { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin: 0 0 10px 0; padding: 8px 10px; background: var(--panel); border: 1px solid var(--border); border-radius: 4px; }
   .toolrow label { font-size: 12.5px; color: var(--fg); display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
   .toolrow .stat { font-size: 12px; color: var(--muted); }
